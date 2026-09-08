@@ -2382,22 +2382,23 @@ void QuadExtractor::collapseThreeValenceDiagonals()
     std::set<Edge> rejectedDiagonals;
     std::unordered_set<size_t> collapsedVertices;
     size_t collapseCount = 0;
-    std::map<Edge, std::vector<size_t>> edgeFaces;
-    std::unordered_map<size_t, std::unordered_set<size_t>> vertexNeighbors;
-    std::unordered_map<size_t, size_t> vertexFaceCounts;
+    std::map<Edge, size_t> edgeCounts;
+    std::vector<std::unordered_set<size_t>> vertexNeighbors;
+    std::vector<size_t> vertexFaceCounts;
     std::unordered_set<size_t> borderVertices;
     bool rebuild = true;
     for (;;) {
         if (rebuild) {
-            edgeFaces.clear();
+            edgeCounts.clear();
             vertexNeighbors.clear();
-            vertexFaceCounts.clear();
+            vertexNeighbors.resize(m_remeshedVertices.size());
+            vertexFaceCounts.assign(m_remeshedVertices.size(), 0);
             borderVertices.clear();
             for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
                 const auto& face = m_remeshedPolygons[faceIndex];
                 for (size_t i = 0; i < face.size(); ++i) {
                     const size_t j = (i + 1) % face.size();
-                    edgeFaces[edgeOf(face[i], face[j])].push_back(faceIndex);
+                    ++edgeCounts[edgeOf(face[i], face[j])];
                     vertexNeighbors[face[i]].insert(face[j]);
                     vertexNeighbors[face[j]].insert(face[i]);
                 }
@@ -2406,8 +2407,8 @@ void QuadExtractor::collapseThreeValenceDiagonals()
             }
 
             // A three valence point on a border is what a border looks like, not a defect
-            for (const auto& it : edgeFaces) {
-                if (2 == it.second.size())
+            for (const auto& it : edgeCounts) {
+                if (2 == it.second)
                     continue;
                 borderVertices.insert(it.first.first);
                 borderVertices.insert(it.first.second);
@@ -4319,54 +4320,93 @@ void QuadExtractor::cleanupTriangles()
     // Only edge lookup is needed; contiguous sorted records avoid tree nodes.
     std::vector<std::pair<Edge, size_t>> edgeFaces;
     edgeFaces.reserve(4 * m_remeshedPolygons.size());
+    std::vector<size_t> edgeOffsets;
+    using RouteChoice = std::tuple<size_t, size_t, size_t>; // length, face, local edge
+    std::priority_queue<RouteChoice, std::vector<RouteChoice>, std::greater<RouteChoice>> pendingRoutes;
+    size_t nextRoute = 0;
+    // Only the selected route changes these entries; no whole-mesh reset is needed.
+    std::vector<size_t> rewriteTargets(m_remeshedVertices.size(), noFace);
+    std::vector<const Vector3*> movedPositions(m_remeshedVertices.size(), nullptr);
+    std::vector<bool> repeatedVertices;
     bool rebuild = true;
     for (;;) {
         if (rebuild) {
-            edgeFaces.clear();
+            edgeOffsets.assign(m_remeshedVertices.size() + 1, 0);
+            repeatedVertices.resize(m_remeshedPolygons.size());
             for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
                 const auto& face = m_remeshedPolygons[faceIndex];
+                repeatedVertices[faceIndex] = faceHasRepeatedVertex(face);
                 for (size_t i = 0; i < face.size(); ++i)
-                    edgeFaces.push_back({ edgeOf(face[i], face[(i + 1) % face.size()]), faceIndex });
+                    ++edgeOffsets[std::min(face[i], face[(i + 1) % face.size()]) + 1];
             }
-
-            std::sort(edgeFaces.begin(), edgeFaces.end());
+            for (size_t v = 1; v < edgeOffsets.size(); ++v)
+                edgeOffsets[v] += edgeOffsets[v - 1];
+            edgeFaces.resize(edgeOffsets.back());
+            for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
+                const auto& face = m_remeshedPolygons[faceIndex];
+                for (size_t i = 0; i < face.size(); ++i) {
+                    const Edge edge = edgeOf(face[i], face[(i + 1) % face.size()]);
+                    edgeFaces[edgeOffsets[edge.first]++] = { edge, faceIndex };
+                }
+            }
+            // The first edge endpoint is already bucketed in increasing order.
+            // Sorting each bucket gives the same complete edge/face order.
+            size_t begin = 0;
+            for (size_t v = 0; v < m_remeshedVertices.size(); ++v) {
+                std::sort(edgeFaces.begin() + begin, edgeFaces.begin() + edgeOffsets[v]);
+                begin = edgeOffsets[v];
+            }
+            pendingRoutes = {};
+            nextRoute = 0;
             rebuild = false;
         }
 
         auto walkRoute = [&](size_t startFace, const Edge& startEdge,
                              std::vector<Edge>* rungs,
                              std::set<size_t>* dissolvedFaces,
-                             size_t* sinkFace) {
-            rungs->clear();
-            dissolvedFaces->clear();
-            dissolvedFaces->insert(startFace);
-            *sinkFace = noFace;
-            std::set<size_t> rungVertices;
+                             size_t* sinkFace) -> size_t {
+            if (rungs)
+                rungs->clear();
+            if (dissolvedFaces) {
+                dissolvedFaces->clear();
+                dissolvedFaces->insert(startFace);
+            }
+            if (sinkFace)
+                *sinkFace = noFace;
+            // Most walks only rank a route. Keep their bounded scratch state on
+            // the stack; materialize the selected route's containers only once.
+            size_t rungVertices[2 * maxRouteLength], visitedFaces[maxRouteLength + 1];
+            size_t vertexCount = 0, visitedCount = 1, length = 0;
+            visitedFaces[0] = startFace;
             size_t currentFace = startFace;
             Edge rung = startEdge;
             for (;;) {
-                if (rungs->size() >= maxRouteLength)
-                    return false;
-                // Two rungs sharing a vertex would collapse into each other
-                if (!rungVertices.insert(rung.first).second)
-                    return false;
-                if (!rungVertices.insert(rung.second).second)
-                    return false;
-                rungs->push_back(rung);
+                if (length >= maxRouteLength)
+                    return 0;
+                // Two rungs sharing a vertex would collapse into each other.
+                for (size_t vertex : { rung.first, rung.second }) {
+                    if (std::find(rungVertices, rungVertices + vertexCount, vertex) != rungVertices + vertexCount)
+                        return 0;
+                    rungVertices[vertexCount++] = vertex;
+                }
+                ++length;
+                if (rungs)
+                    rungs->push_back(rung);
                 const auto first = std::lower_bound(edgeFaces.begin(), edgeFaces.end(), std::make_pair(rung, size_t(0)));
                 const auto last = std::upper_bound(first, edgeFaces.end(), std::make_pair(rung, noFace));
                 const auto count = last - first;
                 if (count == 1)
-                    return true;
+                    return length;
                 if (count != 2)
-                    return false;
+                    return 0;
                 const size_t neighbor = first[0].second == currentFace ? first[1].second : first[0].second;
-                if (dissolvedFaces->end() != dissolvedFaces->find(neighbor))
-                    return false;
+                if (std::find(visitedFaces, visitedFaces + visitedCount, neighbor) != visitedFaces + visitedCount)
+                    return 0;
                 const auto& neighborFace = m_remeshedPolygons[neighbor];
                 if (4 != neighborFace.size()) {
-                    *sinkFace = neighbor;
-                    return true;
+                    if (sinkFace)
+                        *sinkFace = neighbor;
+                    return length;
                 }
                 size_t entry = neighborFace.size();
                 for (size_t i = 0; i < neighborFace.size(); ++i) {
@@ -4376,41 +4416,51 @@ void QuadExtractor::cleanupTriangles()
                     }
                 }
                 if (entry >= neighborFace.size())
-                    return false;
-                dissolvedFaces->insert(neighbor);
+                    return 0;
+                visitedFaces[visitedCount++] = neighbor;
+                if (dissolvedFaces)
+                    dissolvedFaces->insert(neighbor);
                 currentFace = neighbor;
                 rung = edgeOf(neighborFace[(entry + 2) % 4], neighborFace[(entry + 3) % 4]);
             }
         };
 
+        // Rejection leaves the mesh unchanged, so retain all route priorities.
+        // Scan lazily until the first one-edge route, matching the original tie
+        // order without retracing the same strips after each rejected collapse.
+        const auto startEdgeOf = [&](const RouteChoice& choice) {
+            const auto& face = m_remeshedPolygons[std::get<1>(choice)];
+            const size_t edge = std::get<2>(choice);
+            return edgeOf(face[edge], face[(edge + 1) % 3]);
+        };
+        for (;;) {
+            while (!pendingRoutes.empty() && rejectedEdges.count(startEdgeOf(pendingRoutes.top())))
+                pendingRoutes.pop();
+            if ((!pendingRoutes.empty() && std::get<0>(pendingRoutes.top()) == 1) || nextRoute == 3 * m_remeshedPolygons.size())
+                break;
+            const size_t startFace = nextRoute / 3, edge = nextRoute % 3;
+            ++nextRoute;
+            const auto& triangle = m_remeshedPolygons[startFace];
+            if (triangle.size() != 3 || repeatedVertices[startFace]) {
+                nextRoute = 3 * (startFace + 1);
+                continue;
+            }
+            const Edge startEdge = edgeOf(triangle[edge], triangle[(edge + 1) % 3]);
+            if (rejectedEdges.count(startEdge))
+                continue;
+            const size_t length = walkRoute(startFace, startEdge, nullptr, nullptr, nullptr);
+            if (length)
+                pendingRoutes.emplace(length, startFace, edge);
+        }
+        if (pendingRoutes.empty())
+            break;
+        const auto choice = pendingRoutes.top();
+        pendingRoutes.pop();
         std::vector<Edge> route;
         std::set<size_t> routeFaces;
         size_t routeSink = noFace;
-        for (size_t startFace = 0; startFace < m_remeshedPolygons.size() && route.size() != 1; ++startFace) {
-            const auto& triangle = m_remeshedPolygons[startFace];
-            if (3 != triangle.size() || faceHasRepeatedVertex(triangle))
-                continue;
-            for (size_t i = 0; i < 3; ++i) {
-                const Edge startEdge = edgeOf(triangle[i], triangle[(i + 1) % 3]);
-                if (rejectedEdges.end() != rejectedEdges.find(startEdge))
-                    continue;
-                std::vector<Edge> candidateRoute;
-                std::set<size_t> candidateFaces;
-                size_t candidateSink = noFace;
-                if (!walkRoute(startFace, startEdge, &candidateRoute, &candidateFaces, &candidateSink))
-                    continue;
-                // The shorter the ladder, the less of the surrounding mesh it takes with it
-                if (route.empty() || candidateRoute.size() < route.size()) {
-                    route = std::move(candidateRoute);
-                    routeFaces = std::move(candidateFaces);
-                    routeSink = candidateSink;
-                    if (route.size() == 1)
-                        break; // No later route can be shorter.
-                }
-            }
-        }
-        if (route.empty())
-            break;
+        // No topology changed since this route was cached.
+        walkRoute(std::get<1>(choice), startEdgeOf(choice), &route, &routeFaces, &routeSink);
 
         std::unordered_map<size_t, size_t> mergedInto;
         std::unordered_map<size_t, Vector3> mergedPositions;
@@ -4419,15 +4469,22 @@ void QuadExtractor::cleanupTriangles()
             mergedPositions.insert({ rung.first,
                 (m_remeshedVertices[rung.first] + m_remeshedVertices[rung.second]) * 0.5 });
         }
+        // Keep the maps' commit order; use dense mirrors only for mesh-wide queries.
+        for (const auto& item : mergedInto)
+            rewriteTargets[item.first] = item.second;
+        for (const auto& item : mergedPositions)
+            movedPositions[item.first] = &item.second;
+        const auto clearRoute = [&]() {
+            for (const auto& rung : route) {
+                rewriteTargets[rung.second] = noFace;
+                movedPositions[rung.first] = nullptr;
+            }
+        };
         const auto rewriteVertex = [&](size_t vertex) {
-            const auto& findMerged = mergedInto.find(vertex);
-            return mergedInto.end() == findMerged ? vertex : findMerged->second;
+            return rewriteTargets[vertex] == noFace ? vertex : rewriteTargets[vertex];
         };
         const auto rewritePosition = [&](size_t vertex) {
-            const auto& findPosition = mergedPositions.find(vertex);
-            return mergedPositions.end() == findPosition
-                ? m_remeshedVertices[vertex]
-                : findPosition->second;
+            return movedPositions[vertex] ? *movedPositions[vertex] : m_remeshedVertices[vertex];
         };
 
         std::vector<std::pair<size_t, std::vector<size_t>>> changedFaces;
@@ -4437,10 +4494,11 @@ void QuadExtractor::cleanupTriangles()
         for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
             const auto& face = m_remeshedPolygons[faceIndex];
             bool touched = std::any_of(face.begin(), face.end(), [&](size_t v) {
-                return mergedInto.count(v) || mergedPositions.count(v);
+                return rewriteTargets[v] != noFace || movedPositions[v];
             });
-            if (!touched && faceIndex != routeSink && !routeFaces.count(faceIndex)) {
-                if (faceHasRepeatedVertex(face)) {
+            // Every route/sink face contains a moved or retired rung endpoint.
+            if (!touched) {
+                if (repeatedVertices[faceIndex]) {
                     valid = false;
                     break;
                 }
@@ -4451,7 +4509,7 @@ void QuadExtractor::cleanupTriangles()
             for (const auto& vertex : face) {
                 const size_t rewrittenVertex = rewriteVertex(vertex);
                 if (rewrittenVertex != vertex
-                    || mergedPositions.end() != mergedPositions.find(vertex))
+                    || movedPositions[vertex])
                     touched = true;
                 if (candidate.empty() || candidate.back() != rewrittenVertex)
                     candidate.push_back(rewrittenVertex);
@@ -4497,8 +4555,7 @@ void QuadExtractor::cleanupTriangles()
                 }
                 for (size_t i = 0; i < candidate.size(); ++i) {
                     const Edge edge = edgeOf(candidate[i], candidate[(i + 1) % candidate.size()]);
-                    if (mergedPositions.end() == mergedPositions.find(edge.first)
-                        && mergedPositions.end() == mergedPositions.find(edge.second))
+                    if (!movedPositions[edge.first] && !movedPositions[edge.second])
                         continue;
                     if (++touchedEdgeCounts[edge] > 2) {
                         valid = false;
@@ -4511,6 +4568,7 @@ void QuadExtractor::cleanupTriangles()
             changedFaces.push_back({ faceIndex, std::move(candidate) });
         }
         if (!valid) {
+            clearRoute();
             rejectedEdges.insert(route.front());
             continue;
         }
@@ -4534,6 +4592,7 @@ void QuadExtractor::cleanupTriangles()
             m_remeshedVertices[it.first] = it.second;
             collapsedVertices.insert(it.first);
         }
+        clearRoute();
         m_remeshedPolygons = std::move(rewritten);
         ++collapseCount;
         rebuild = true;
