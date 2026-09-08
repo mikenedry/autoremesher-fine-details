@@ -236,6 +236,7 @@ IsotropicRemesher::IsotropicRemesher(const std::vector<Vector3> *vertices,
     m_vertices(vertices),
     m_triangles(triangles)
 {
+    m_workingVertexCount = m_vertices->size();
     m_halfedgeMesh = new IsotropicHalfedgeMesh(*m_vertices, *m_triangles);
     m_initialAverageEdgeLength = m_halfedgeMesh->averageEdgeLength();
 }
@@ -398,7 +399,9 @@ void IsotropicRemesher::splitLongEdges(double maxEdgeLengthSquared)
                 edgeMaxLenSq = std::pow(4.0 / 3.0 * edgeTarget, 2);
             }
             if (lengthSquared > edgeMaxLenSq) {
+                if (m_refinementVertexLimit && m_workingVertexCount >= m_refinementVertexLimit) return;
                 m_halfedgeMesh->breakEdge(halfedge);
+                ++m_workingVertexCount;
                 break;
             }
             halfedge = nextHalfedge;
@@ -440,6 +443,7 @@ void IsotropicRemesher::collapseShortEdges(double minEdgeLengthSquared, double m
             if (lengthSquared < edgeMinLenSq) {
                 if (!halfedge->startVertex->featured && !nextHalfedge->startVertex->featured) {
                     if (m_halfedgeMesh->collapseEdge(halfedge, edgeMaxLenSq)) {
+                        --m_workingVertexCount;
                         break;
                     }
                 }

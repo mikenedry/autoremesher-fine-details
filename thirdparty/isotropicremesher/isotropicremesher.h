@@ -40,6 +40,7 @@ public:
     double initialAverageEdgeLength();
     void setSharpEdgeIncludedAngle(double degrees);
     void setTargetEdgeLength(double edgeLength);
+    void setRefinementVertexLimit(size_t limit) { m_refinementVertexLimit = limit; }
     void setVertexTargetEdgeLengths(const std::vector<double> *targetLengths);
     void setTargetTriangleCount(size_t triangleCount);
     void setSmoothNormalDegrees(double degrees);
@@ -53,6 +54,7 @@ public:
     IsotropicHalfedgeMesh *remeshedHalfedgeMesh();
     
 private:
+    size_t m_refinementVertexLimit = 0, m_workingVertexCount = 0;
     const std::vector<Vector3> *m_vertices = nullptr;
     const std::vector<std::vector<size_t>> *m_triangles = nullptr;
     std::vector<Vector3> *m_triangleNormals = nullptr;

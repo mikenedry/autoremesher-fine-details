@@ -77,6 +77,8 @@ public:
         return m_remeshedTriangles;
     }
 
+    void setRefineOnly(bool value) { m_refineOnly = value; }
+    void setBalanceDiagonals(bool value) { m_balanceDiagonals = value; }
     bool remesh();
 
     void debugExportObj(const char* filename);
@@ -90,6 +92,8 @@ private:
     double m_sharpEdgeDegrees = 60;
     double m_smoothNormalDegrees = 0.0;
     int m_remeshIterations = 3;
+    bool m_refineOnly = false;
+    bool m_balanceDiagonals = false;
     ProgressHandler m_progressHandler;
     std::vector<Vector3> m_remeshedVertices;
     std::vector<std::vector<size_t>> m_remeshedTriangles;
