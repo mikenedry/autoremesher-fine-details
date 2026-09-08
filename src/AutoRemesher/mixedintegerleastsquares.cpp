@@ -411,7 +411,12 @@ void MixedIntegerLeastSquares::endPass(size_t pass)
     ++m_pass;
 }
 
-void MixedIntegerLeastSquares::clearEnergy() { m_energy.clear(); }
+void MixedIntegerLeastSquares::clearEnergy()
+{
+    m_energy.clear();
+    m_reducedEnergy.clear();
+    m_system.reset();
+}
 
 void MixedIntegerLeastSquares::addEnergy(const std::vector<std::pair<size_t, double>>& c, double rhs, double weight)
 {
@@ -425,53 +430,138 @@ void MixedIntegerLeastSquares::addEnergy(const std::vector<std::pair<size_t, dou
         if (x.first < m_size && x.second != 0)
             row.coefficients.push_back({ x.first, x.second });
     normalize(&row.coefficients);
-    if (!row.coefficients.empty())
+    if (m_kernelBuilt) {
+        Row reduced;
+        reduced.rhs = rhs;
+        reduced.weight = weight;
+        for (const auto& c : row.coefficients)
+            axpy(&reduced.coefficients, kernelLine(c.index), c.a);
+        m_reducedEnergy.push_back(std::move(reduced));
+        m_system.reset();
+    } else if (!row.coefficients.empty())
         m_energy.push_back(std::move(row));
 }
 
 void MixedIntegerLeastSquares::addEnergy(size_t a, double ca, size_t b, double cb, double rhs, double weight)
 {
-    if (weight <= 0)
-        return;
-    Row row;
-    row.rhs = rhs;
-    row.weight = weight;
-    row.coefficients.reserve(2);
-    if (a < m_size && 0.0 != ca)
-        row.coefficients.push_back({ a, ca });
-    if (b < m_size && 0.0 != cb)
-        row.coefficients.push_back({ b, cb });
-    normalize(&row.coefficients);
-    if (!row.coefficients.empty())
-        m_energy.push_back(std::move(row));
+    addEnergy({ { a, ca }, { b, cb } }, rhs, weight);
 }
 
-bool MixedIntegerLeastSquares::solveIteration()
+bool MixedIntegerLeastSquares::separateIntegerCoordinates(size_t first, size_t second, double difference)
+{
+    if (first >= m_size || second >= m_size || !m_kernelBuilt || !std::isfinite(difference) || difference == 0)
+        return false;
+    if (m_initialPeriod[first] != 1 || m_initialPeriod[second] != 1)
+        return false;
+    Row row;
+    row.coefficients = kernelLine(second);
+    row.rhs = difference;
+    row.weight = 1;
+    axpy(&row.coefficients, kernelLine(first), -1);
+    if (m_separationPeriods.empty())
+        m_separationPeriods = m_period;
+    double lattice = 1e100;
+    for (const auto& c : row.coefficients)
+        lattice = std::min(lattice, std::fabs(c.a * m_separationPeriods[c.index]));
+    if (!(lattice > 0) || lattice == 1e100)
+        return false;
+    row.rhs = std::copysign(std::max(1.0, lattice), difference);
+    for (const auto& fixed : m_separations) {
+        double factor = 0;
+        for (const auto& c : row.coefficients)
+            if (c.index == fixed.coefficients.front().index)
+                factor = c.a;
+        for (const auto& c : fixed.coefficients)
+            add(&row.coefficients, c.index, -factor * c.a);
+        row.rhs -= factor * fixed.rhs;
+    }
+    normalize(&row.coefficients);
+    size_t pivot = row.coefficients.size();
+    double step = 1e100;
+    for (size_t i = 0; i < row.coefficients.size(); ++i) {
+        const auto& c = row.coefficients[i];
+        if (m_period[c.index] <= 0)
+            return false;
+        const double value = std::fabs(c.a * m_period[c.index]);
+        if (value < step) {
+            step = value;
+            pivot = i;
+        }
+    }
+    if (pivot == row.coefficients.size() || !(step > 0))
+        return false;
+    for (const auto& c : row.coefficients)
+        if (std::fabs(c.a * m_period[c.index] / step - std::round(c.a * m_period[c.index] / step)) > 1e-8)
+            return false;
+    if (std::fabs(row.rhs / step - std::round(row.rhs / step)) > 1e-8)
+        return false;
+    std::swap(row.coefficients.front(), row.coefficients[pivot]);
+    const double factor = row.coefficients.front().a;
+    for (auto& c : row.coefficients)
+        c.a /= factor;
+    row.rhs /= factor;
+    m_period[row.coefficients.front().index] = 0;
+    m_separations.push_back(std::move(row));
+    m_system.reset();
+    return true;
+}
+
+// Greedy round-and-resolve background: Bommes, Zimmer & Kobbelt, MIQ (2009), Section 2.
+// https://doi.org/10.1145/1531326.1531383
+// The normalized-distance batch budget below is a separate implementation policy.
+void MixedIntegerLeastSquares::admitRoundingBatch()
+{
+    // Remesher param/speedup_nested.cpp: bound the total normalized
+    // rounding displacement and re-solve before admitting the next batch.
+    std::vector<std::pair<double, size_t>> rankedVariables;
+    size_t integerCount = 0;
+    for (size_t i = 0; i < m_kernelSize; ++i)
+        if (m_period[i] > 0) {
+            ++integerCount;
+            if (!m_fixed[i])
+                rankedVariables.push_back({ std::fabs(double(float(m_values[i] / m_period[i])) - std::round(double(float(m_values[i] / m_period[i])))), i });
+        }
+    std::sort(rankedVariables.begin(), rankedVariables.end());
+    const double distanceBudget = std::max(.5, double(integerCount) / 470);
+    double admittedDistance = 0;
+    for (size_t k = 0; k < rankedVariables.size(); ++k) {
+        if (k && admittedDistance + rankedVariables[k].first > distanceBudget)
+            break;
+        admittedDistance += rankedVariables[k].first;
+        m_fixed[rankedVariables[k].second] = true;
+    }
+}
+
+bool MixedIntegerLeastSquares::solveIteration(bool round, bool budgeted)
 {
     if (m_pass < 3 || m_kernelSize == 0)
         return false;
     if (m_values.empty()) {
         m_values.assign(m_kernelSize, 0.0);
         m_fixed.assign(m_kernelSize, false);
-    } else {
-        double threshold = 1e20;
-        for (size_t i = 0; i < m_kernelSize; ++i)
-            if (!m_fixed[i] && m_period[i] > 0) {
-                double d = std::fabs(m_values[i] / m_period[i] - std::round(m_values[i] / m_period[i]));
-                threshold = std::max(d + .001, 1.0);
-                break;
-            }
-        for (size_t i = 0; i < m_kernelSize; ++i)
-            if (!m_fixed[i] && m_period[i] > 0) {
-                double d = std::fabs(m_values[i] / m_period[i] - std::round(m_values[i] / m_period[i]));
-                if (d < threshold)
+    } else if (round && budgeted) {
+        admitRoundingBatch();
+    }
+    if (round && !budgeted && !m_values.empty()) {
+        // The first call only solves; subsequent calls retain bulk admission.
+        if (m_system)
+            for (size_t i = 0; i < m_kernelSize; ++i)
+                if (m_period[i] > 0)
                     m_fixed[i] = true;
-            }
     }
     if (nullptr == m_system) {
         m_system.reset(new ConstrainedLeastSquares(m_kernelSize));
         std::vector<std::pair<size_t, double>> coefficients;
-        for (const Row& energy : m_reducedEnergy) {
+        for (Row energy : m_reducedEnergy) {
+            for (const auto& fixed : m_separations) {
+                double factor = 0;
+                for (const auto& c : energy.coefficients)
+                    if (c.index == fixed.coefficients.front().index)
+                        factor = c.a;
+                for (const auto& c : fixed.coefficients)
+                    add(&energy.coefficients, c.index, -factor * c.a);
+                energy.rhs -= factor * fixed.rhs;
+            }
             coefficients.clear();
             coefficients.reserve(energy.coefficients.size());
             for (const Coeff& coefficient : energy.coefficients)
@@ -482,8 +572,16 @@ bool MixedIntegerLeastSquares::solveIteration()
     m_system->clearConstraints();
     for (size_t i = 0; i < m_kernelSize; ++i)
         if (m_fixed[i])
-            m_system->addConstraint({ { i, 1.0 } }, double(m_period[i]) * std::round(m_values[i] / double(m_period[i])));
-    return m_system->solve(&m_values);
+            m_system->addConstraint({ { i, 1.0 } }, double(m_period[i]) * std::round(budgeted ? double(float(m_values[i] / m_period[i])) : m_values[i] / m_period[i]));
+    if (!m_system->solve(&m_values))
+        return false;
+    for (auto it = m_separations.rbegin(); it != m_separations.rend(); ++it) {
+        double value = it->rhs;
+        for (size_t i = 1; i < it->coefficients.size(); ++i)
+            value -= it->coefficients[i].a * m_values[it->coefficients[i].index];
+        m_values[it->coefficients.front().index] = value;
+    }
+    return true;
 }
 
 bool MixedIntegerLeastSquares::converged() const
