@@ -272,7 +272,8 @@ bool ConstrainedLeastSquares::buildReducedSystem()
     cache.scaledMatrix.resize(rowCount, columnCount);
     cache.scaledMatrix.setFromTriplets(entries.begin(), entries.end());
 
-    cache.normalMatrix = (cache.scaledMatrix.transpose() * cache.scaledMatrix).pruned();
+    // Evaluate first to avoid the linked-list accumulator in Eigen's pruning product.
+    cache.normalMatrix = (cache.scaledMatrix.transpose() * cache.scaledMatrix).eval().pruned();
     Eigen::SparseMatrix<double> regularizer(columnCount, columnCount);
     regularizer.setIdentity();
     cache.normalMatrix += ridgeFor(cache.normalMatrix) * regularizer;
