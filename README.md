@@ -1,8 +1,24 @@
-# AutoRemesher
+# AutoRemesher — Fine Detail Fork
 
-AutoRemesher is a cross-platform automatic quad remeshing tool that converts high-polygon meshes into clean quad-based topology. It is built on top of libraries: [Geogram](https://github.com/BrunoLevy/geogram), [libigl](https://github.com/libigl), [isotropicremesher](https://github.com/huxingyi/isotropicremesher) and [others](https://github.com/huxingyi/autoremesher/blob/master/ACKNOWLEDGEMENTS.html).
+This is a fork of [AutoRemesher](https://github.com/huxingyi/autoremesher) focused on preserving fine geometric details during automatic quad remeshing. It builds on the original cross-platform application and remeshing pipeline created by **Jeremy HU ([huxingyi](https://github.com/huxingyi))**.
 
-Buy me a coffee for staying up late coding :-) [![](https://www.paypalobjects.com/en_US/i/btn/btn_donate_SM.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=GHALWLWXYGCU6&item_name=Support+me+coding+in+my+spare+time&currency_code=AUD&source=url)
+The fine-detail improvements in this fork were coded with **GPT-6 Astra**, with human direction and review. Credit for the original AutoRemesher architecture, application and foundational work belongs to Jeremy HU and the upstream contributors.
+
+## Focus areas
+
+The changes target meshes where small features, narrow connections or closely spaced surfaces are easily lost during preparation and quad extraction:
+
+- **Sculpted and anatomical detail:** ears, noses, lips, facial profiles and other regions with tight curvature or shallow relief.
+- **Thin connected geometry:** antennas, rods, handles and chain links, where missing a short section can break an otherwise continuous part.
+- **Mechanical and manufactured details:** rims, bevels, grooves, recesses, small knobs and mounting features alongside broad flat or curved surfaces.
+- **Openings and nearby surface layers:** holes, tubes, thin shells and inset panels, where cleanup must preserve intended boundaries and avoid connecting opposite sides.
+- **Mixed feature sizes and separate parts:** small components and localized detail that need adequate sampling without uniformly increasing the resolution of the entire object.
+
+Source-surface tracking, shared feature and curvature analysis, directional sizing, and topology-aware extraction work together to preserve these features. Preparation alternatives are compared using surface fit and topology so that a cleaner-looking fragment does not win simply by omitting difficult geometry. These are optimization targets; achievable detail still depends on the source mesh, settings and available quad budget.
+
+AutoRemesher uses [Geogram](https://github.com/BrunoLevy/geogram), [libigl](https://github.com/libigl), [isotropicremesher](https://github.com/huxingyi/isotropicremesher) and [other libraries](ACKNOWLEDGEMENTS.html).
+
+Support the original author's work: [donate to Jeremy HU](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=GHALWLWXYGCU6&item_name=Support+me+coding+in+my+spare+time&currency_code=AUD&source=url).
 
 <img width="3644" height="2202" alt="autoremesher-1 0-screenshot" src="https://github.com/user-attachments/assets/47851f1e-127c-49af-81b7-0c8ac06fb3ad" />
 
@@ -29,7 +45,7 @@ sudo apt install build-essential qt5-qmake qtbase5-dev qttools5-dev-tools libqt5
 sudo apt install libtbb-dev libgl1-mesa-dev
 
 # Clone and build
-git clone https://github.com/huxingyi/autoremesher.git
+git clone https://github.com/mikenedry/autoremesher.git
 cd autoremesher
 qmake
 make -j$(nproc)
@@ -100,7 +116,7 @@ brew install qt@5 tbb cmake
 
 # Build
 export PATH="/usr/local/opt/qt@5/bin:$PATH"
-git clone https://github.com/huxingyi/autoremesher.git
+git clone https://github.com/mikenedry/autoremesher.git
 cd autoremesher
 qmake CONFIG+=sdk_no_version_check
 make -j$(sysctl -n hw.logicalcpu)
@@ -123,7 +139,9 @@ AutoRemesher has a CLI mode for headless processing. Try it with one of the [com
     --anisotropy 1.0
 ```
 
-### Quick Start
+### Upstream prebuilt downloads
+
+The downloads below are from the original project and do not include this fork's fine-detail changes. To use this fork, build from source using the instructions above.
 
 #### Windows
 
@@ -144,7 +162,7 @@ $ chmod a+x ./autoremesher-<version>.AppImage
 $ ./autoremesher-<version>.AppImage
 ```
 
-### Links
+### Upstream coverage
 
 - [Check out open-source auto-retopology tool AutoRemesher](http://www.cgchannel.com/2020/08/check-out-open-source-auto-retopology-tool-autoremesher/) **cgchannel.com**
 - [A New Open-Source Auto-Retopology Tool](https://80.lv/articles/a-new-open-source-auto-retopology-tool/) **80.lv**
@@ -159,10 +177,10 @@ $ ./autoremesher-<version>.AppImage
 
 ## License
 
-AutoRemesher is licensed under the MIT License - see the [LICENSE](https://github.com/huxingyi/autoremesher/blob/master/LICENSE) file for details.
+AutoRemesher is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgements
 
-See the full [ACKNOWLEDGEMENTS](https://github.com/huxingyi/autoremesher/blob/master/ACKNOWLEDGEMENTS.html) for a list of libraries and resources used in this project.
+See the full [ACKNOWLEDGEMENTS](ACKNOWLEDGEMENTS.html) for a list of libraries and resources used in this project.
 
 <!-- Sponsors begin --><!-- Sponsors end -->
