@@ -85,7 +85,9 @@ public:
 
     void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
     size_t constrainedCurveVertices() const { return m_curveVertices; }
-    bool extract();
+    void setFullTurnVertices(const std::vector<size_t>* vertices) { m_fullTurnVertices = vertices; }
+    size_t poleTriangles() const { return m_poleTriangles; }
+    bool extract(bool rejectUnsupportedCaps = false, bool closeResidualHoles = false);
 
 private:
     // The isoline a connection was cut from: which uv coordinate is held constant,
@@ -97,7 +99,25 @@ private:
     };
 
     const SurfaceAnalysis* m_analysis = nullptr;
+    bool m_rejectUnsupportedCaps = false;
     size_t m_curveVertices = 0;
+    const std::vector<size_t>* m_fullTurnVertices = nullptr;
+    size_t m_poleTriangles = 0;
+    std::vector<size_t> m_poleOwners;
+    std::unordered_map<size_t, Vector3> m_poleNormals;
+    void initializePoleOwners(const std::vector<size_t>& sourceTriangles);
+    size_t commonPoleOwner(const std::vector<size_t>& vertices) const;
+    template <class IndexMap>
+    void remapPoleOwners(const IndexMap& oldToNew)
+    {
+        if (m_poleOwners.empty())
+            return;
+        std::vector<size_t> owners(oldToNew.size());
+        for (const auto& item : oldToNew)
+            owners[item.second] = m_poleOwners[item.first];
+        m_poleOwners.swap(owners);
+    }
+    size_t fullTurnCenter(const std::vector<size_t>& loop) const;
     const std::vector<Vector3>* m_vertices = nullptr;
     const std::vector<std::vector<size_t>>* m_triangles = nullptr;
     const std::vector<std::vector<Vector2>>* m_triangleUvs = nullptr;
@@ -133,7 +153,7 @@ private:
         const std::vector<size_t>& pointSourceTriangles,
         std::unordered_map<size_t, std::unordered_set<size_t>>& edgeConnectMap,
         std::vector<std::vector<size_t>>* quads);
-    void simplifyGraph(std::unordered_map<size_t, std::unordered_set<size_t>>& graph);
+    void simplifyGraph(std::unordered_map<size_t, std::unordered_set<size_t>>& graph, const std::vector<Vector3>& points);
     void searchBoundaries(const std::set<std::pair<size_t, size_t>>& halfEdges,
         std::vector<std::vector<size_t>>* loops);
     void fixHoleWithQuads(std::vector<size_t>& hole, bool checkScore = true);
@@ -161,7 +181,7 @@ private:
     void mergeSharedFiveEdgeFaces(const ProgressHandler* progressHandler = nullptr);
     bool removeNonManifoldFaces();
     void rebuildHalfEdges();
-    void fixHoles();
+    void fixHoles(size_t maximumEdges = 65);
 };
 
 }

@@ -794,6 +794,7 @@ bool AutoRemesher::remesh()
                         thread.remesher->setSurfaceAnalysis(thread.island->analysis.get());
                         thread.remesher->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
                         thread.remesher->setSingularVertices(&thread.capturedSingularVertexIndices);
+                        thread.remesher->setFullTurnVertices(&thread.parameterizer->fullTurnVertices());
                         thread.remesher->setProgressHandler(
                             thread.autoRemesher->makeStageProgress(thread.islandIndex,
                                 islandParameterizeEnd, 1.0f, 1.0f));

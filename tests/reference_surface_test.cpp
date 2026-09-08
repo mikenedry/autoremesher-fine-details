@@ -48,6 +48,15 @@ static void tube(size_t sides, size_t rings, std::vector<Vec3>& p, Faces& t,
         }
 }
 
+static std::map<std::pair<size_t, size_t>, size_t> edgeUses(const Faces& faces)
+{
+    std::map<std::pair<size_t, size_t>, size_t> uses;
+    for (const auto& f : faces)
+        for (size_t k = 0; k < f.size(); ++k)
+            ++uses[std::minmax(f[k], f[(k + 1) % f.size()])];
+    return uses;
+}
+
 static void checkReferences(Remesher& remesher, const std::vector<Vec3>& vertices,
     const Faces& faces)
 {
@@ -170,6 +179,167 @@ static void tinyIsland()
     require(large && small, "global sizing removed the tiny disconnected part");
 }
 
+static void thinTubeCleanup()
+{
+    // Six-sided capped tube: valence-only cleanup used to unzip it from an end.
+    std::vector<Vec3> p;
+    Faces t;
+    std::vector<std::vector<UV>> uv;
+    const size_t rings = 25;
+    for (size_t j = 0; j < rings; ++j)
+        for (size_t i = 0; i < 6; ++i)
+            p.emplace_back(double(j), .1 * std::cos(i * M_PI / 3), .1 * std::sin(i * M_PI / 3));
+    const auto quad = [&](const std::vector<size_t>& q, const std::vector<UV>& u) {
+        for (size_t k = 1; k < 3; ++k) {
+            t.push_back({ q[0], q[k], q[k + 1] });
+            uv.push_back({ u[0], u[k], u[k + 1] });
+        }
+    };
+    for (size_t j = 0; j + 1 < rings; ++j)
+        for (size_t i = 0; i < 6; ++i)
+            quad({ 6 * j + i, 6 * j + (i + 1) % 6, 6 * (j + 1) + (i + 1) % 6, 6 * (j + 1) + i },
+                { { double(i), double(j) }, { double(i + 1), double(j) }, { double(i + 1), double(j + 1) }, { double(i), double(j + 1) } });
+    quad({ 5, 4, 1, 0 }, { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } });
+    quad({ 4, 3, 2, 1 }, { { 1, 0 }, { 2, 0 }, { 2, 1 }, { 1, 1 } });
+    size_t o = 6 * (rings - 1);
+    quad({ o, o + 1, o + 4, o + 5 }, { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } });
+    quad({ o + 1, o + 2, o + 3, o + 4 }, { { 1, 0 }, { 2, 0 }, { 2, 1 }, { 1, 1 } });
+    AutoRemesher::QuadExtractor e(&p, &t, &uv);
+    require(e.extract(), "thin tube extraction failed");
+    double area = 0;
+    const auto& v = e.remeshedVertices();
+    for (const auto& f : e.remeshedQuads())
+        for (size_t k = 1; k + 1 < f.size(); ++k)
+            area += .5 * Vec3::crossProduct(v[f[k]] - v[f[0]], v[f[k + 1]] - v[f[0]]).length();
+    require(area > .8 * .6 * (rings - 1), "valence cleanup flattened the thin tube");
+    // Multiple extracted patches with source ownership must both survive cleanup.
+    const size_t vertices = p.size(), triangles = t.size();
+    for (size_t i = 0; i < vertices; ++i)
+        p.push_back(p[i] + Vec3(0, 1, 0));
+    for (size_t i = 0; i < triangles; ++i) {
+        auto face = t[i];
+        for (auto& v : face)
+            v += vertices;
+        t.push_back(face);
+        uv.push_back(uv[i]);
+    }
+    AutoRemesher::SurfaceAnalysis analysis(AutoRemesher::SurfaceMesh(p, t), .1, 90, 1, 1);
+    AutoRemesher::QuadExtractor both(&p, &t, &uv);
+    both.setSurfaceAnalysis(&analysis);
+    require(both.extract(), "fragment regression failed to extract");
+    bool lower = false, upper = false;
+    for (const auto& f : both.remeshedQuads()) {
+        const double y = both.remeshedVertices()[f[0]].y();
+        lower = lower || y < .3;
+        upper = upper || y > .7;
+    }
+    require(lower && upper, "cleanup discarded an extracted source patch");
+}
+
+static void telescopingTube()
+{
+    // A four-node circumference is a graph cycle, but is not a surface cap.
+    // The former extractor capped two shoulder rings and split this single tube.
+    std::vector<Vec3> p;
+    Faces f;
+    std::vector<std::vector<UV>> uv;
+    const double x[] = { 0, 1, 1.02, 2, 2.02, 3 }, r[] = { .4, .4, .3, .3, .2, .2 };
+    for (size_t j = 0; j < 6; ++j)
+        for (size_t i = 0; i < 4; ++i)
+            p.push_back({ x[j], r[j] * std::cos(i * M_PI / 2), r[j] * std::sin(i * M_PI / 2) });
+    const auto quad = [&](const std::vector<size_t>& q, const std::vector<UV>& u) {
+        for (size_t k = 1; k < 3; ++k) {
+            f.push_back({ q[0], q[k], q[k + 1] });
+            uv.push_back({ u[0], u[k], u[k + 1] });
+        }
+    };
+    // Shoulders occur first so physical shoulder normals seed shared source corners.
+    for (size_t j : { 1, 3, 0, 2, 4 })
+        for (size_t i = 0; i < 4; ++i)
+            quad({ 4 * j + i, 4 * j + (i + 1) % 4, 4 * (j + 1) + (i + 1) % 4, 4 * (j + 1) + i },
+                { { double(i), double(j) }, { double(i + 1), double(j) }, { double(i + 1), double(j + 1) }, { double(i), double(j + 1) } });
+    quad({ 3, 2, 1, 0 }, { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } });
+    quad({ 20, 21, 22, 23 }, { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } });
+    AutoRemesher::SurfaceAnalysis a(AutoRemesher::SurfaceMesh(p, f), .5, 90, 0, 0, true, false);
+    AutoRemesher::QuadExtractor q(&p, &f, &uv);
+    q.setSurfaceAnalysis(&a);
+    require(q.extract(true), "telescoping tube extraction failed");
+    std::vector<Faces> components;
+    AutoRemesher::MeshSeparator::splitToIslands(q.remeshedQuads(), components);
+    require(components.size() == 1, "source-unsupported shoulder caps severed a telescoping tube");
+    for (const auto& face : q.remeshedQuads())
+        for (size_t k = 0; k < face.size(); ++k)
+            require((q.remeshedVertices()[face[k]] - q.remeshedVertices()[face[(k + 1) % face.size()]]).lengthSquared() > 0,
+                "telescoping tube contains a collapsed edge");
+}
+
+static void disconnectedFans()
+{
+    // Two affine 3x3 sheets touch only at the origin. Graph simplification
+    // may trim their outer corners, but cleanup must retain the shared-origin
+    // neighborhood on both sheets and give each a separate boundary fan.
+    std::vector<Vec3> p { { 0, 0, 0 } };
+    Faces t;
+    std::vector<std::vector<UV>> uv;
+    for (int sign : { -1, 1 }) {
+        size_t grid[4][4];
+        for (size_t j = 0; j < 4; ++j)
+            for (size_t i = 0; i < 4; ++i) {
+                grid[j][i] = i || j ? p.size() : 0;
+                if (i || j)
+                    p.push_back({ sign * double(i), sign * double(j), 0 });
+            }
+        for (size_t j = 0; j < 3; ++j)
+            for (size_t i = 0; i < 3; ++i) {
+                const size_t a = grid[j][i], b = grid[j][i + 1], c = grid[j + 1][i + 1], d = grid[j + 1][i];
+                t.push_back({ a, b, c });
+                uv.push_back({ { double(i), double(j) }, { double(i + 1), double(j) }, { double(i + 1), double(j + 1) } });
+                t.push_back({ a, c, d });
+                uv.push_back({ { double(i), double(j) }, { double(i + 1), double(j + 1) }, { double(i), double(j + 1) } });
+            }
+    }
+    AutoRemesher::SurfaceAnalysis analysis(AutoRemesher::SurfaceMesh(p, t), 1, 90, 0, 0);
+    AutoRemesher::QuadExtractor extractor(&p, &t, &uv);
+    extractor.setSurfaceAnalysis(&analysis);
+    require(extractor.extract(), "disconnected fans failed to extract");
+    const auto& points = extractor.remeshedVertices();
+    const auto& faces = extractor.remeshedQuads();
+    std::map<size_t, unsigned> originSides;
+    std::map<std::pair<size_t, size_t>, size_t> edges;
+    for (const auto& face : faces) {
+        require(face.size() == 4, "fan repair did not produce quads");
+        Vec3 center;
+        for (size_t v : face)
+            center += points[v];
+        require(center.x() * center.y() > 0, "fan repair connected different source sheets");
+        for (size_t k = 0; k < face.size(); ++k) {
+            const size_t v = face[k];
+            if (points[v].lengthSquared() < 1e-18)
+                originSides[v] |= center.x() > 0 ? 1 : 2;
+            ++edges[std::minmax(v, face[(k + 1) % face.size()])];
+        }
+    }
+    require(originSides.size() == 2, "fan repair discarded the shared-origin neighborhoods");
+    unsigned sides = 0;
+    for (const auto& v : originSides) {
+        require(v.second == 1 || v.second == 2, "fan repair left the source sheets joined");
+        sides |= v.second;
+    }
+    require(sides == 3, "fan repair discarded one source sheet");
+    std::map<size_t, size_t> boundaryDegree;
+    for (const auto& edge : edges) {
+        require(edge.second <= 2, "fan repair created a nonmanifold edge");
+        if (edge.second == 1) {
+            ++boundaryDegree[edge.first.first];
+            ++boundaryDegree[edge.first.second];
+        }
+    }
+    for (const auto& v : boundaryDegree)
+        require(v.second == 2, "fan repair left touching boundary fans");
+    for (const auto& v : originSides)
+        require(boundaryDegree[v.first] == 2, "fan repair capped a source boundary");
+}
+
 static void directionalQuadCover()
 {
     // A very uneven triangulation must reproduce an affine rectangular grid,
@@ -219,6 +389,28 @@ static void directionalQuadCover()
                         const auto& uv = result.triangleUvs[f][k];
                         require(std::fabs(uv.x() - p.x() / (worldScale * uSpacing)) < 1e-5 && std::fabs(uv.y() - p.y() / worldScale) < 1e-5, adaptiveSizing ? "final spacing changed a resolved affine grid" : "quad cover distorted an affine grid");
                     }
+                AutoRemesher::SurfaceAnalysis analysis(mesh, worldScale, 90, 0, 0);
+                AutoRemesher::QuadExtractor extractor(&positions, &triangles, &result.triangleUvs);
+                extractor.setSurfaceAnalysis(&analysis);
+                require(extractor.extract(), "affine rectangle extraction failed");
+                const auto& points = extractor.remeshedVertices();
+                const auto& faces = extractor.remeshedQuads();
+                require(faces.size() == size_t(8 / uSpacing), "affine rectangle cell count changed");
+                std::set<size_t> used;
+                double area = 0;
+                for (const auto& face : faces) {
+                    require(face.size() == 4, "affine grid lost a quad");
+                    used.insert(face.begin(), face.end());
+                    for (size_t k = 1; k + 1 < face.size(); ++k)
+                        area += .5 * Vec3::crossProduct(points[face[k]] - points[face[0]], points[face[k + 1]] - points[face[0]]).length();
+                }
+                for (size_t c = 0; c < 4; ++c) {
+                    bool found = false;
+                    for (size_t v : used)
+                        found |= (points[v] - positions[c]).length() < 1e-9 * worldScale;
+                    require(found, "graph simplification erased an authored boundary corner");
+                }
+                require(std::fabs(area - 8 * worldScale * worldScale) < 1e-8 * worldScale * worldScale, "affine rectangle lost area");
             }
 }
 
@@ -293,6 +485,40 @@ static void featureIntegerLattice()
     }
 }
 
+static void tubeOpenings()
+{
+    for (size_t sides : { 4, 12 }) {
+        std::vector<Vec3> p;
+        Faces t;
+        std::vector<std::vector<UV>> uv;
+        tube(sides, sides == 4 ? 3 : 5, p, t, uv);
+        AutoRemesher::SurfaceAnalysis analysis(AutoRemesher::SurfaceMesh(p, t), .5, 90, 0, 0);
+        AutoRemesher::QuadExtractor extractor(&p, &t, &uv);
+        if (sides == 12)
+            extractor.setSurfaceAnalysis(&analysis);
+        require(extractor.extract(), "tube opening extraction failed");
+        const auto edges = edgeUses(extractor.remeshedQuads());
+        require(!edges.empty(), "hole closure discarded the tube");
+        if (sides == 4) {
+            // Without source boundaries, fill each small hole exactly once.
+            for (const auto& edge : edges)
+                require(edge.second == 2, "four-edge hole was filled more than once");
+        } else {
+            // Authored source rims must remain open.
+            require(analysis.onSourceBoundary(p[0]) && !analysis.onSourceBoundary(p[2 * sides]), "source rim confused with interior");
+            size_t lower = 0, upper = 0;
+            for (const auto& edge : edges)
+                if (edge.second == 1) {
+                    const auto& a = extractor.remeshedVertices()[edge.first.first];
+                    const auto& b = extractor.remeshedVertices()[edge.first.second];
+                    lower += std::fabs(a.z()) < 1e-8 && std::fabs(b.z()) < 1e-8;
+                    upper += std::fabs(a.z() - 4) < 1e-8 && std::fabs(b.z() - 4) < 1e-8;
+                }
+            require(lower == sides && upper == sides, "authored source opening was capped");
+        }
+    }
+}
+
 static void radialCover()
 {
     std::vector<Vec3> p { { 0, 0, 0 } };
@@ -329,6 +555,61 @@ static void radialCover()
         area += a;
     }
     require(area > 10, "radial grid collapsed to a line");
+
+    // Join two radial disks into a thin closed shell. Pole ownership must follow
+    // source connectivity even when both poles satisfy a loop's plane tolerance.
+    const size_t offset = p.size(), diskFaces = t.size();
+    for (size_t v = 0; v < offset; ++v)
+        p.push_back(p[v] - Vec3(0, 0, .002));
+    for (size_t f = 0; f < diskFaces; ++f) {
+        t.push_back({ t[f][2] + offset, t[f][1] + offset, t[f][0] + offset });
+        field.push_back(field[f]);
+        for (size_t k : { size_t(1), size_t(0), size_t(2) })
+            features.push_back(features[3 * f + k]);
+    }
+    for (size_t i = 0; i < sides; ++i) {
+        const size_t a = 1 + 3 * sides + i, b = 1 + 3 * sides + (i + 1) % sides;
+        t.push_back({ a, a + offset, b + offset });
+        t.push_back({ a, b + offset, b });
+        field.insert(field.end(), 2, Vec3(0, 0, 1));
+        features.insert(features.end(), 6, 0);
+    }
+    AutoRemesher::SurfaceMesh shell(p, t);
+    require(AutoRemesher::QuadParameterizer::parameterize(p, t, &field, .25 / shell.averageEdgeLength(), 90, &result,
+                nullptr, nullptr, nullptr, nullptr, &features, true),
+        "closed radial cover failed");
+    require(result.fullTurnVertices == std::vector<size_t>({ 0, offset }), "closed shell lost a radial pole");
+    AutoRemesher::SurfaceAnalysis analysis(shell, .25, 90, 0, 0, true, false);
+    Faces firstFaces;
+    std::vector<Vec3> firstPoints;
+    for (size_t order = 0; order < 2; ++order) {
+        AutoRemesher::QuadExtractor q(&p, &t, &result.triangleUvs);
+        q.setSurfaceAnalysis(&analysis);
+        q.setFullTurnVertices(&result.fullTurnVertices);
+        require(q.extract(), "closed radial extraction failed");
+        size_t fans[2] = { 0, 0 };
+        for (const auto& face : q.remeshedQuads())
+            if (face.size() == 3)
+                for (size_t v : face) {
+                    const auto& center = q.remeshedVertices()[v];
+                    if (center.x() != 0 || center.y() != 0)
+                        continue;
+                    ++fans[center.z() < -.001];
+                    for (size_t corner : face)
+                        require(std::fabs(q.remeshedVertices()[corner].z() - center.z()) < 1e-10,
+                            "pole fan crossed to another source sheet");
+                }
+        require(fans[0] > 0 && fans[1] > 0, "pole ownership discarded a radial fan");
+        if (order) {
+            require(q.remeshedQuads() == firstFaces && q.remeshedVertices().size() == firstPoints.size(), "pole order changed topology");
+            for (size_t v = 0; v < firstPoints.size(); ++v)
+                require((q.remeshedVertices()[v] - firstPoints[v]).lengthSquared() == 0, "pole order changed geometry");
+        } else {
+            firstFaces = q.remeshedQuads();
+            firstPoints = q.remeshedVertices();
+        }
+        std::reverse(result.fullTurnVertices.begin(), result.fullTurnVertices.end());
+    }
 }
 
 int main(int argc, char** argv)
@@ -337,9 +618,13 @@ int main(int argc, char** argv)
         if (argc == 1) {
             fixtures();
             tinyIsland();
+            thinTubeCleanup();
+            telescopingTube();
+            disconnectedFans();
             directionalQuadCover();
             oddTubePeriod();
             featureIntegerLattice();
+            tubeOpenings();
             radialCover();
         } else {
             require(argc == 4, "usage: reference_surface_test [input.obj target_quads output.obj]");
