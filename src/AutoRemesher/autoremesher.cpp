@@ -178,9 +178,10 @@ namespace {
         const bool recoverArea = preparation == PreparationRecovery::Diagonals && b.parts == 1 && b.area < a.area * .5 && b.angle < a.angle && b.boundary <= a.boundary;
         const double fittingLimit = std::max(a.error * (recoverArea ? 1.05 : 1.), std::pow(.05 * reference.length(), 2));
         return b.corners && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15))) && ((recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
-                   // A dense perforated layout must not veto a clean source surface
-                   // merely because its smaller faces have lower centroid error.
-                   (preparation != PreparationRecovery::None && a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < a.angle && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads <= a.nonquads) ||
+                   // Closing unintended holes permits small angle distortion, while
+                   // retaining fitting and connectivity limits. Closing boundary edges
+                   // may replace them with a small number of nonquad repair faces.
+                   (a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < std::max(a.angle, .1) && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads + b.boundary <= a.nonquads + a.boundary) ||
                    // Avoid buying tiny fitting gains with a needlessly dense flat grid.
                    ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads));
     }
@@ -1061,19 +1062,23 @@ bool AutoRemesher::remesh()
                 // A small closed convex input can already have a regular, source-fitting
                 // delivery. Keep that result instead of solving denser alternatives.
                 const auto& source = *thread.autoRemesher->m_preparedIslands[i].reference;
-                if (m_parameterizationThreads->size() == 1 && thread.remesher
+                const bool smallClosedSource = m_parameterizationThreads->size() == 1
                     && isSmallConvexSource(source.vertices, source.triangles)
-                    && std::find(source.edgeFeatures.begin(), source.edgeFeatures.end(), ReferenceSurface::EdgeFeature::Boundary) == source.edgeFeatures.end()) {
+                    && std::find(source.edgeFeatures.begin(), source.edgeFeatures.end(), ReferenceSurface::EdgeFeature::Boundary) == source.edgeFeatures.end();
+                const auto resolvedLayout = [&]() {
+                    if (!smallClosedSource || !thread.remesher)
+                        return false;
                     const auto& analysis = *thread.island->analysis;
                     const auto quality = measureLayout(*thread.remesher, analysis,
                         calculateMeshArea(source.vertices, source.triangles));
-                    if (quality.angle < .1 && quality.area < .03
+                    return quality.angle < .1 && quality.area < .03
                         && quality.error < std::pow(.1 * analysis.length(), 2)
                         && quality.boundary == 0 && quality.nonmanifold == 0
-                        && quality.collapsed == 0 && quality.nonquads * 1000 <= thread.remesher->remeshedQuads().size() && quality.parts == 1) {
-                        std::cerr << "Resolved small source layout on island " << i << '\n';
-                        continue;
-                    }
+                        && quality.collapsed == 0 && quality.nonquads * 500 <= thread.remesher->remeshedQuads().size() && quality.parts == 1;
+                };
+                if (resolvedLayout()) {
+                    std::cerr << "Resolved small source layout on island " << i << '\n';
+                    continue;
                 }
                 layoutTrial = true;
                 // Keep the baseline winner; one extra solve tests final-frame spacing
@@ -1135,6 +1140,8 @@ bool AutoRemesher::remesh()
                     sourceLayoutAccepted |= variant > 0 && accepted;
                     if (!accepted)
                         thread = std::move(saved);
+                    else if (resolvedLayout())
+                        break;
                 }
             }
         }

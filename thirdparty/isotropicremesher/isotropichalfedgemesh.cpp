@@ -816,7 +816,7 @@ void IsotropicHalfedgeMesh::featureHalfedge(Halfedge *halfedge, double radians)
     }
     
     if (Vector3::angle(halfedge->leftFace->_normal, 
-            opposite->leftFace->_normal) >= radians) {
+            opposite->leftFace->_normal) + 1e-12 >= radians) {
         halfedge->featureState = opposite->featureState = 1;
         halfedge->startVertex->featured = opposite->startVertex->featured = true;
         return;

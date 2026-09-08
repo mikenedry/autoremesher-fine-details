@@ -464,11 +464,11 @@ void IsotropicRemesher::flipEdges()
         do {
             const auto &nextHalfedge = halfedge->nextHalfedge;
             if (nullptr != halfedge->oppositeHalfedge) {
-                //if (!halfedge->startVertex->featured && !nextHalfedge->startVertex->featured) {
+                if (!(halfedge->startVertex->featured && nextHalfedge->startVertex->featured)) {
                     if (m_halfedgeMesh->flipEdge(halfedge)) {
                         break;
                     }
-                //}
+                }
             }
             halfedge = nextHalfedge;
         } while (halfedge != startHalfedge);
@@ -484,8 +484,9 @@ void IsotropicRemesher::shiftVertices()
     for (IsotropicHalfedgeMesh::Vertex *vertex = m_halfedgeMesh->moveToNextVertex(nullptr); 
             nullptr != vertex;
             vertex = m_halfedgeMesh->moveToNextVertex(vertex)) {
-        //if (vertex->featured)
-        //    continue;
+        // Projection also skips protected vertices, so keep them on their source features.
+        if (vertex->featured)
+            continue;
         m_halfedgeMesh->relaxVertex(vertex);
     }
 }
