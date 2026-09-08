@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <queue>
 
 namespace AutoRemesher {
 namespace {
@@ -243,8 +244,27 @@ void MixedIntegerLeastSquares::finalizeConstraints()
 void MixedIntegerLeastSquares::buildKernel()
 {
     m_kernel.rows.resize(m_size);
-    for (size_t i = 0; i < m_size; ++i)
-        m_kernel.rows[i] = line(i);
+    // An original coordinate reaches one signed root. Expand that root directly
+    // instead of allocating intermediate sparse rows for a singleton product.
+    for (size_t i = 0; i < m_size; ++i) {
+        auto& row = m_kernel.rows[i];
+        row.clear();
+        if (m_m0[i] == noIndex)
+            continue;
+        const Coeff root = m_m1.empty() ? Coeff { m_m0[i], 1.0 } : m_m1[m_m0[i]];
+        if (std::fabs(root.a) <= dropTolerance)
+            continue;
+        if (m_m2.rows.empty()) {
+            row.push_back(root);
+        } else {
+            row.reserve(m_m2.rows[root.index].size());
+            for (const Coeff& c : m_m2.rows[root.index]) {
+                const double a = root.a * c.a;
+                if (std::fabs(a) > dropTolerance)
+                    row.push_back({ c.index, a });
+            }
+        }
+    }
     m_kernelBuilt = true;
 }
 
@@ -552,15 +572,76 @@ bool MixedIntegerLeastSquares::solveIteration(bool round, bool budgeted)
     if (nullptr == m_system) {
         m_system.reset(new ConstrainedLeastSquares(m_kernelSize));
         std::vector<std::pair<size_t, double>> coefficients;
+        const size_t substitutionSize = m_separations.empty() ? 0 : m_kernelSize;
+        std::vector<size_t> separationAt(substitutionSize, noIndex), touched;
+        std::vector<double> value(substitutionSize, 0.0);
+        std::vector<char> seen(substitutionSize, 0), queued(m_separations.size(), 0);
+        for (size_t i = 0; i < m_separations.size(); ++i)
+            separationAt[m_separations[i].coefficients.front().index] = i;
+        std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> pending;
+        const auto enqueue = [&](size_t i) {
+            if (i != noIndex && !queued[i]) {
+                queued[i] = 1;
+                pending.push(i);
+            }
+        };
         for (Row energy : m_reducedEnergy) {
-            for (const auto& fixed : m_separations) {
-                double factor = 0;
-                for (const auto& c : energy.coefficients)
-                    if (c.index == fixed.coefficients.front().index)
-                        factor = c.a;
-                for (const auto& c : fixed.coefficients)
-                    add(&energy.coefficients, c.index, -factor * c.a);
-                energy.rhs -= factor * fixed.rhs;
+            if (!m_separations.empty()) {
+                // Visit only reachable pivots, in the original substitution order.
+                // Scratch coefficients avoid moving a sorted row on every insertion.
+                for (const auto& c : energy.coefficients) {
+                    value[c.index] = c.a;
+                    seen[c.index] = 1;
+                    touched.push_back(c.index);
+                    enqueue(separationAt[c.index]);
+                }
+                size_t next = 0;
+                const auto skipZeros = [&](size_t end) {
+                    // Subtracting an absent pivot can still change -0 to +0.
+                    if (energy.rhs == 0 && std::signbit(energy.rhs))
+                        for (size_t i = next; i < end && std::signbit(energy.rhs); ++i)
+                            energy.rhs -= 0.0 * m_separations[i].rhs;
+                    next = end + 1;
+                };
+                while (!pending.empty()) {
+                    const size_t index = pending.top();
+                    pending.pop();
+                    queued[index] = 0;
+                    skipZeros(index);
+                    const auto& fixed = m_separations[index];
+                    const double factor = value[fixed.coefficients.front().index];
+                    if (factor != 0.0)
+                        for (const auto& c : fixed.coefficients) {
+                            const double delta = -factor * c.a;
+                            if (std::fabs(delta) < 1e-14)
+                                continue;
+                            double& a = value[c.index];
+                            if (a != 0.0) {
+                                a += delta;
+                                if (std::fabs(a) < dropTolerance)
+                                    a = 0.0;
+                            } else {
+                                a = delta;
+                            }
+                            if (!seen[c.index]) {
+                                seen[c.index] = 1;
+                                touched.push_back(c.index);
+                            }
+                            if (a != 0.0 && separationAt[c.index] > index)
+                                enqueue(separationAt[c.index]);
+                        }
+                    energy.rhs -= factor * fixed.rhs;
+                }
+                skipZeros(m_separations.size());
+                std::sort(touched.begin(), touched.end());
+                energy.coefficients.clear();
+                for (size_t i : touched) {
+                    if (value[i] != 0.0)
+                        energy.coefficients.push_back({ i, value[i] });
+                    value[i] = 0.0;
+                    seen[i] = 0;
+                }
+                touched.clear();
             }
             coefficients.clear();
             coefficients.reserve(energy.coefficients.size());

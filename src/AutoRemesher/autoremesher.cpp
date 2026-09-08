@@ -94,78 +94,80 @@ namespace {
         Source,
         Creases,
         Diagonals };
+    struct LayoutQuality {
+        double angle = 0, error = 0, area = 0, weight = 0;
+        size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0;
+    };
+    LayoutQuality measureLayout(QuadExtractor& mesh, const SurfaceAnalysis& reference, double sourceArea)
+    {
+        LayoutQuality q;
+        const auto& points = mesh.remeshedVertices();
+        const auto& faces = mesh.remeshedQuads();
+        std::map<std::pair<size_t, size_t>, size_t> edges;
+        for (const auto& f : faces) {
+            Vector3 center;
+            double area = 0;
+            for (size_t v : f)
+                center += points[v];
+            center /= double(f.size());
+            for (size_t k = 1; k + 1 < f.size(); ++k)
+                area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
+            q.area += area;
+            q.error += area * reference.surfaceDistanceSquared(center);
+            if (f.size() != 4) {
+                bool trim = false;
+                for (size_t k = 0; k < f.size(); ++k)
+                    trim |= reference.onSourceBoundary((points[f[k]] + points[f[(k + 1) % f.size()]]) * .5);
+                q.nonquads += !trim;
+            }
+            for (size_t k = 0; k < f.size(); ++k) {
+                ++edges[std::minmax(f[k], f[(k + 1) % f.size()])];
+                if (f.size() != 4)
+                    continue;
+                const Vector3 a = points[f[(k + 3) % 4]] - points[f[k]], b = points[f[(k + 1) % 4]] - points[f[k]];
+                q.angle += area * (a.lengthSquared() * b.lengthSquared() > 0 ? std::asin(std::min(1.0, std::fabs(Vector3::dotProduct(a.normalized(), b.normalized())))) : M_PI / 2);
+                ++q.corners;
+                q.weight += area;
+            }
+        }
+        // Authored holes and trimmed borders are geometry, not extraction defects.
+        for (const auto& e : edges) {
+            q.boundary += e.second == 1 && !reference.onSourceBoundary((points[e.first.first] + points[e.first.second]) * .5) && !reference.onSourceBoundary(points[e.first.first], points[e.first.second]);
+            q.nonmanifold += e.second > 2;
+            q.collapsed += (points[e.first.first] - points[e.first.second]).lengthSquared() <= std::pow(1e-10 * reference.length(), 2);
+        }
+        std::vector<std::vector<std::vector<size_t>>> parts;
+        MeshSeparator::splitToIslands(faces, parts);
+        // Numerical dust must not veto recovery of a complete source form.
+        for (const auto& part : parts) {
+            double area = 0;
+            for (const auto& f : part)
+                for (size_t k = 1; k + 1 < f.size(); ++k)
+                    area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
+            q.parts += area > 1e-6 * sourceArea;
+        }
+        q.nonquads -= std::min(q.nonquads, mesh.poleTriangles());
+        q.angle = q.weight ? q.angle / q.weight : M_PI;
+        q.error = q.area > 0 ? q.error / q.area : std::numeric_limits<double>::infinity();
+        // A quad and its reversed copy enclose no surface; their angles
+        // cannot veto recovery of the original component.
+        if (faces.size() == 2 && faces[0].size() == 4 && faces[1].size() == 4) {
+            const auto& a = faces[0];
+            const auto& b = faces[1];
+            for (size_t k = 0; k < 4; ++k)
+                if (a[0] == b[k] && a[1] == b[(k + 3) % 4] && a[2] == b[(k + 2) % 4] && a[3] == b[(k + 1) % 4])
+                    q.angle = M_PI;
+        }
+        q.error = .5 * (q.error + reference.missingSurfaceError(points, faces));
+        q.area = q.area > 0 && sourceArea > 0 ? std::fabs(std::log(q.area / sourceArea)) : std::numeric_limits<double>::infinity();
+        return q;
+    }
+
     bool preferFeatureLayout(QuadExtractor& before, QuadExtractor& after,
         const SurfaceAnalysis& reference, double sourceArea, bool recoverConnectivity = false, PreparationRecovery preparation = PreparationRecovery::None)
     {
         const bool recoverPreparation = preparation == PreparationRecovery::Creases;
-        struct Quality {
-            double angle = 0, error = 0, area = 0, weight = 0;
-            size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0;
-        };
-        const auto measure = [&](QuadExtractor& mesh) {
-            Quality q;
-            const auto& points = mesh.remeshedVertices();
-            const auto& faces = mesh.remeshedQuads();
-            std::map<std::pair<size_t, size_t>, size_t> edges;
-            for (const auto& f : faces) {
-                Vector3 center;
-                double area = 0;
-                for (size_t v : f)
-                    center += points[v];
-                center /= double(f.size());
-                for (size_t k = 1; k + 1 < f.size(); ++k)
-                    area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
-                q.area += area;
-                q.error += area * reference.surfaceDistanceSquared(center);
-                if (f.size() != 4) {
-                    bool trim = false;
-                    for (size_t k = 0; k < f.size(); ++k)
-                        trim |= reference.onSourceBoundary((points[f[k]] + points[f[(k + 1) % f.size()]]) * .5);
-                    q.nonquads += !trim;
-                }
-                for (size_t k = 0; k < f.size(); ++k) {
-                    ++edges[std::minmax(f[k], f[(k + 1) % f.size()])];
-                    if (f.size() != 4)
-                        continue;
-                    const Vector3 a = points[f[(k + 3) % 4]] - points[f[k]], b = points[f[(k + 1) % 4]] - points[f[k]];
-                    q.angle += area * (a.lengthSquared() * b.lengthSquared() > 0 ? std::asin(std::min(1.0, std::fabs(Vector3::dotProduct(a.normalized(), b.normalized())))) : M_PI / 2);
-                    ++q.corners;
-                    q.weight += area;
-                }
-            }
-            // Authored holes and trimmed borders are geometry, not extraction defects.
-            for (const auto& e : edges) {
-                q.boundary += e.second == 1 && !reference.onSourceBoundary((points[e.first.first] + points[e.first.second]) * .5) && !reference.onSourceBoundary(points[e.first.first], points[e.first.second]);
-                q.nonmanifold += e.second > 2;
-                q.collapsed += (points[e.first.first] - points[e.first.second]).lengthSquared() <= std::pow(1e-10 * reference.length(), 2);
-            }
-            std::vector<std::vector<std::vector<size_t>>> parts;
-            MeshSeparator::splitToIslands(faces, parts);
-            // Numerical dust must not veto recovery of a complete source form.
-            for (const auto& part : parts) {
-                double area = 0;
-                for (const auto& f : part)
-                    for (size_t k = 1; k + 1 < f.size(); ++k)
-                        area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
-                q.parts += area > 1e-6 * sourceArea;
-            }
-            q.nonquads -= std::min(q.nonquads, mesh.poleTriangles());
-            q.angle = q.weight ? q.angle / q.weight : M_PI;
-            q.error = q.area > 0 ? q.error / q.area : std::numeric_limits<double>::infinity();
-            // A quad and its reversed copy enclose no surface; their angles
-            // cannot veto recovery of the original component.
-            if (faces.size() == 2 && faces[0].size() == 4 && faces[1].size() == 4) {
-                const auto& a = faces[0];
-                const auto& b = faces[1];
-                for (size_t k = 0; k < 4; ++k)
-                    if (a[0] == b[k] && a[1] == b[(k + 3) % 4] && a[2] == b[(k + 2) % 4] && a[3] == b[(k + 1) % 4])
-                        q.angle = M_PI;
-            }
-            q.error = .5 * (q.error + reference.missingSurfaceError(points, faces));
-            q.area = q.area > 0 && sourceArea > 0 ? std::fabs(std::log(q.area / sourceArea)) : std::numeric_limits<double>::infinity();
-            return q;
-        };
-        const auto a = measure(before), b = measure(after);
+        const auto a = measureLayout(before, reference, sourceArea), b = measureLayout(after, reference, sourceArea);
         std::cerr << "Candidate quality (angle/error/area/boundary/parts/collapsed): "
                   << a.angle << '/' << a.error << '/' << a.area << '/' << a.boundary << '/' << a.parts << '/' << a.collapsed << " -> "
                   << b.angle << '/' << b.error << '/' << b.area << '/' << b.boundary << '/' << b.parts << '/' << b.collapsed << '\n';
@@ -181,6 +183,33 @@ namespace {
                    (preparation != PreparationRecovery::None && a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < a.angle && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads <= a.nonquads) ||
                    // Avoid buying tiny fitting gains with a needlessly dense flat grid.
                    ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads));
+    }
+
+    bool isSmallConvexSource(const std::vector<Vector3>& vertices,
+        const std::vector<std::vector<size_t>>& triangles)
+    {
+        // Bound the plane tests; dense or concave inputs retain full recovery.
+        if (vertices.empty() || triangles.size() > 2048)
+            return false;
+        double extent = 0;
+        for (const auto& p : vertices)
+            extent = std::max(extent, (p - vertices.front()).length());
+        const double tolerance = 1e-7 * extent;
+        for (const auto& face : triangles) {
+            const auto& origin = vertices[face[0]];
+            const auto normal = Vector3::normal(origin, vertices[face[1]], vertices[face[2]]);
+            if (normal.lengthSquared() == 0)
+                return false;
+            bool positive = false, negative = false;
+            for (const auto& p : vertices) {
+                const double distance = Vector3::dotProduct(p - origin, normal);
+                positive |= distance > tolerance;
+                negative |= distance < -tolerance;
+                if (positive && negative)
+                    return false;
+            }
+        }
+        return true;
     }
 
     void markSharpEdgeVertices(const std::vector<Vector3>& vertices,
@@ -1029,6 +1058,23 @@ bool AutoRemesher::remesh()
                     thread.feedbackAccepted = accepted;
                 };
                 feedback();
+                // A small closed convex input can already have a regular, source-fitting
+                // delivery. Keep that result instead of solving denser alternatives.
+                const auto& source = *thread.autoRemesher->m_preparedIslands[i].reference;
+                if (m_parameterizationThreads->size() == 1 && thread.remesher
+                    && isSmallConvexSource(source.vertices, source.triangles)
+                    && std::find(source.edgeFeatures.begin(), source.edgeFeatures.end(), ReferenceSurface::EdgeFeature::Boundary) == source.edgeFeatures.end()) {
+                    const auto& analysis = *thread.island->analysis;
+                    const auto quality = measureLayout(*thread.remesher, analysis,
+                        calculateMeshArea(source.vertices, source.triangles));
+                    if (quality.angle < .1 && quality.area < .03
+                        && quality.error < std::pow(.1 * analysis.length(), 2)
+                        && quality.boundary == 0 && quality.nonmanifold == 0
+                        && quality.collapsed == 0 && quality.nonquads * 1000 <= thread.remesher->remeshedQuads().size() && quality.parts == 1) {
+                        std::cerr << "Resolved small source layout on island " << i << '\n';
+                        continue;
+                    }
+                }
                 layoutTrial = true;
                 // Keep the baseline winner; one extra solve tests final-frame spacing
                 // on the same prepared source under the unchanged quality checks.
