@@ -342,8 +342,39 @@ void SurfaceAnalysis::measureFaceCurvature()
         centers[f] = center(mesh, f);
         areas[f] = Vector3::area(mesh.position(t[0]), mesh.position(t[1]), mesh.position(t[2]));
         totalArea += areas[f];
+    }
+    // Ignore crease bending only on resolved planar patches. Narrow bands still
+    // need its density safeguard; 2 * area / perimeter estimates their width.
+    std::vector<size_t> patchOfFace(count, none);
+    std::vector<char> resolvedPlanar(count, false);
+    const double planeTolerance = 1e-8 * std::sqrt(totalArea);
+    std::vector<size_t> patch;
+    for (size_t seed = 0; seed < count; ++seed) {
+        if (patchOfFace[seed] != none)
+            continue;
+        patch.assign(1, seed);
+        patchOfFace[seed] = seed;
+        const Vector3 normal = mesh.faceNormal(seed);
+        double area = 0, perimeter = 0;
+        for (size_t i = 0; i < patch.size(); ++i) {
+            const size_t f = patch[i];
+            area += areas[f];
+            for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
+                const size_t g = mesh.adjacentFace(c);
+                if (g == none || dot(normal, mesh.faceNormal(g)) < 1 - 1e-10 || std::fabs(dot(normal, centers[g] - centers[seed])) > planeTolerance || (patchOfFace[g] != none && patchOfFace[g] != seed)) {
+                    perimeter += mesh.edgeVector(c).length();
+                } else if (patchOfFace[g] == none) {
+                    patchOfFace[g] = seed;
+                    patch.push_back(g);
+                }
+            }
+        }
+        for (size_t f : patch)
+            resolvedPlanar[f] = perimeter > 0 && 2 * area > m_length * perimeter;
+    }
+    for (size_t f = 0; f < count; ++f) {
         for (size_t c = 3 * f; c < 3 * f + 3; ++c)
-            if (!mesh.isBoundaryCorner(c)) {
+            if (!mesh.isBoundaryCorner(c) && (!resolvedPlanar[f] || m_features[c] == 0)) {
                 const Vector3 across = Vector3::crossProduct(mesh.faceNormal(f), mesh.edgeVector(c).normalized());
                 const Eigen::Vector3d d(across.x(), across.y(), across.z());
                 const Vector3 normal = mesh.faceNormal(f), acrossNormal = mesh.faceNormal(mesh.adjacentFace(c));

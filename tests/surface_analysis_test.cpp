@@ -1,4 +1,5 @@
 #include <AutoRemesher/SurfaceAnalysis>
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -101,6 +102,13 @@ static void creaseAndTransfer()
         }
     SurfaceMesh mesh(p, t);
     SurfaceAnalysis analysis(mesh, .2, 90, 1, 1);
+    for (const auto& face : analysis.faces())
+        require(face.major < 1e-12 && face.minor < 1e-12 && face.scale == 1, "a crease injected curvature into its planar patches");
+    auto narrow = p;
+    for (auto& point : narrow)
+        point = V(point.x(), .01 * point.y(), .01 * point.z());
+    SurfaceAnalysis band(SurfaceMesh(narrow, t), .2, 90, 1, 1);
+    require(std::any_of(band.faces().begin(), band.faces().end(), [](const SurfaceGuidance::Face& face) { return face.major > 1 && face.scale < 1; }), "narrow planar bands lost their curvature density safeguard");
     require(analysis.onSourceBoundary(V(.005, 0, 0)), "interior crease hid a nearby authored boundary");
     require(!analysis.onSourceBoundary(V(1, 0, 0)), "interior crease was mistaken for a boundary");
     const auto exact = analysis.transfer(mesh, true);
