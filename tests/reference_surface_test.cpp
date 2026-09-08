@@ -1,6 +1,16 @@
-// Preparation regressions and an optional headless OBJ driver.
+// Geometry regressions and an optional headless OBJ driver.
 #include <AutoRemesher/AutoRemesher>
+#include <AutoRemesher/FrameField>
+#include <AutoRemesher/IsotropicRemesher>
 #include <AutoRemesher/MeshSeparator>
+#include <AutoRemesher/MixedIntegerLeastSquares>
+#include <AutoRemesher/QuadExtractor>
+#include <AutoRemesher/QuadParameterizer>
+#include <AutoRemesher/SurfaceAnalysis>
+#include <isotropichalfedgemesh.h>
+#include <isotropicremesher.h>
+#include <map>
+#include <set>
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "../src/tiny_obj_loader.h"
 #include <cmath>
@@ -14,6 +24,7 @@ using Remesher = AutoRemesher::AutoRemesher;
 using Vec3 = AutoRemesher::Vector3;
 using Faces = std::vector<std::vector<size_t>>;
 using Feature = Remesher::ReferenceSurface::EdgeFeature;
+using UV = AutoRemesher::Vector2;
 
 static void require(bool condition, const char* message)
 {
@@ -29,6 +40,13 @@ static void checkReferences(Remesher& remesher, const std::vector<Vec3>& vertice
     for (const auto& prepared : remesher.preparedIslands()) {
         require(bool(prepared.reference), "missing reference");
         const auto& ref = *prepared.reference;
+        require(bool(prepared.analysis), "missing persistent source analysis");
+        require(prepared.analysis->faces().size() == ref.triangles.size(), "source metric domain");
+        for (const auto& chain : prepared.analysis->chains()) {
+            require(chain.first < ref.vertices.size() && chain.last < ref.vertices.size(), "chain endpoint provenance");
+            for (size_t corner : chain.corners)
+                require(corner < 3 * ref.triangles.size(), "chain corner provenance");
+        }
         static_assert(std::is_const<typename std::remove_reference<decltype(ref)>::type>::value,
             "reference surface must be immutable");
         require(ref.vertices.size() == ref.sourceVertexIds.size(), "vertex provenance size");
@@ -36,8 +54,7 @@ static void checkReferences(Remesher& remesher, const std::vector<Vec3>& vertice
         require(ref.edgeFeatures.size() == 3 * ref.triangles.size(), "feature provenance size");
         for (size_t i = 0; i < ref.vertices.size(); ++i) {
             require(ref.sourceVertexIds[i] < vertices.size(), "source vertex domain");
-            for (size_t axis = 0; axis < 3; ++axis)
-                require(ref.vertices[i][axis] == vertices[ref.sourceVertexIds[i]][axis], "reference position changed");
+            require((ref.vertices[i] - vertices[ref.sourceVertexIds[i]]).lengthSquared() == 0, "reference position changed");
         }
         for (size_t i = 0; i < ref.triangles.size(); ++i) {
             const size_t source = ref.sourceTriangleIds[i];
@@ -99,7 +116,7 @@ static void fixtures()
         require(edge != Feature::Sharp, "new threshold not captured");
     remesher.setTargetTriangleCount(0);
     require(!remesher.remesh() && remesher.preparedIslands().empty(), "failed run exposes stale preparation");
-    require(remesher.remeshedVertices().empty() && remesher.remeshedQuads().empty() && remesher.isotropicVertices().empty() && remesher.isotropicTriangles().empty(), "failed run exposes stale output");
+    require(remesher.remeshedVertices().empty() && remesher.remeshedQuads().empty() && remesher.isotropicVertices().empty() && remesher.isotropicTriangles().empty() && remesher.isotropicTriangleUvs().empty(), "failed run exposes stale delivery");
     require(retained->vertices[0][0] == original[0][0], "retained reference expired");
 
     // Equal face values must retain distinct input row IDs.
@@ -110,11 +127,39 @@ static void fixtures()
     require(ids.size() == 2 && ids[0][0] == 0 && ids[1][0] == 1, "duplicate source face identity");
 }
 
+static void tinyIsland()
+{
+    const std::vector<Vec3> cube { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 },
+        { 0, 0, 1 }, { 1, 0, 1 }, { 1, 1, 1 }, { 0, 1, 1 } };
+    const Faces quads { { 0, 3, 2, 1 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 0, 4, 7 } };
+    std::vector<Vec3> vertices = cube;
+    Faces triangles;
+    for (const auto& p : cube)
+        vertices.push_back(p * .01 + Vec3(3, 0, 0));
+    for (size_t offset : { size_t(0), size_t(8) })
+        for (const auto& q : quads) {
+            triangles.push_back({ q[0] + offset, q[1] + offset, q[2] + offset });
+            triangles.push_back({ q[0] + offset, q[2] + offset, q[3] + offset });
+        }
+    Remesher remesher(vertices, triangles);
+    remesher.setTargetTriangleCount(2000);
+    remesher.setSharpEdgeDegrees(80);
+    require(remesher.remesh(), "tiny island regression failed to remesh");
+    bool large = false, small = false;
+    for (const auto& q : remesher.remeshedQuads()) {
+        const auto& p = remesher.remeshedVertices()[q[0]];
+        large = large || p.x() < 2;
+        small = small || p.x() > 2;
+    }
+    require(large && small, "global sizing removed the tiny disconnected part");
+}
+
 int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
             fixtures();
+            tinyIsland();
         } else {
             require(argc == 4, "usage: reference_surface_test [input.obj target_quads output.obj]");
             tinyobj::attrib_t attributes;
@@ -156,6 +201,13 @@ int main(int argc, char** argv)
                 out << '\n';
             }
             require(out.good(), "OBJ write failed");
+            size_t chains = 0, selected = 0;
+            for (const auto& island : remesher.preparedIslands())
+                for (const auto& chain : island.analysis->chains()) {
+                    ++chains;
+                    selected += chain.strength > 0;
+                }
+            std::cout << "Feature chains: " << selected << " selected of " << chains << '\n';
             std::cout << "Reference islands: " << remesher.preparedIslands().size()
                       << ", decimation used: " << remesher.decimated() << '\n';
         }

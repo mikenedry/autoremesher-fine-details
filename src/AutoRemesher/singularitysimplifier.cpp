@@ -161,7 +161,7 @@ void SingularitySimplifier::buildFramesAndConnection()
         const size_t f = m_mesh.cornerFace(c), g = m_mesh.cornerFace(other);
         const Vector3 edge = m_mesh.edgeVector(c);
         m_connection[c] = std::atan2(Vector3::dotProduct(edge, m_frameV[g]), Vector3::dotProduct(edge, m_frameU[g])) - std::atan2(Vector3::dotProduct(edge, m_frameV[f]), Vector3::dotProduct(edge, m_frameU[f]));
-        m_sharpCorner[c] = m_mesh.normalAngle(c) >= m_sharpEdgeDegrees * M_PI / 180.0;
+        m_sharpCorner[c] = (m_featureCorners && (*m_featureCorners)[c]) || std::fabs(m_mesh.normalAngle(c)) >= m_sharpEdgeDegrees * M_PI / 180.0;
     }
     std::vector<size_t> every(faces);
     for (size_t f = 0; f < faces; ++f)

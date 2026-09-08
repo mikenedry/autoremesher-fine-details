@@ -78,9 +78,10 @@ namespace {
         ConstraintU = 1,
         ConstraintV = 2 };
     int edgeConstraint(const SurfaceMesh& mesh, size_t c, const std::vector<Vector3>& field,
-        const std::vector<Vector3>& normals, double hardEdgeDegrees)
+        const std::vector<Vector3>& normals, double hardEdgeDegrees,
+        const std::vector<char>* featureCorners)
     {
-        if (mesh.oppositeCorner(c) != SurfaceMesh::npos && std::fabs(mesh.normalAngle(c)) * 180.0 / M_PI < hardEdgeDegrees)
+        if (!(featureCorners && (*featureCorners)[c]) && mesh.oppositeCorner(c) != SurfaceMesh::npos && std::fabs(mesh.normalAngle(c)) * 180.0 / M_PI < hardEdgeDegrees)
             return ConstraintNone;
         const size_t f = mesh.cornerFace(c);
         const Vector3 edge = unit(mesh.edgeVector(c), Vector3(1, 0, 0));
@@ -232,13 +233,14 @@ namespace {
     }
 
     std::vector<signed char> computeCornerConstraints(const SurfaceMesh& mesh,
-        const std::vector<Vector3>& field, const std::vector<Vector3>& normals, double hardEdgeDegrees)
+        const std::vector<Vector3>& field, const std::vector<Vector3>& normals, double hardEdgeDegrees,
+        const std::vector<char>* featureCorners)
     {
         const size_t corners = mesh.cornerCount();
         std::vector<signed char> cornerConstraints(corners, ConstraintNone);
         tbb::parallel_for(tbb::blocked_range<size_t>(0, corners), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t c = range.begin(); c != range.end(); ++c)
-                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees));
+                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees, featureCorners));
         });
         return cornerConstraints;
     }
@@ -647,7 +649,8 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<double>* faceScaling,
     const std::vector<double>* faceScalingU,
     const std::vector<double>* faceScalingV,
-    const ProgressHandler* progressHandler)
+    const ProgressHandler* progressHandler,
+    const std::vector<char>* featureCorners)
 {
     const auto report = [progressHandler](float fraction, const char* name) {
         if (nullptr != progressHandler && *progressHandler)
@@ -685,7 +688,7 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<int> rotation = computeCornerRotations(mesh, result->field, normals);
     result->cornerRotations = rotation;
     const std::vector<signed char> cornerConstraints = computeCornerConstraints(mesh, result->field,
-        normals, hardEdgeDegrees);
+        normals, hardEdgeDegrees, featureCorners);
     if (trackDirectionalScale)
         applyDirectionalSwaps(mesh, fieldBeforeBrush, result->field, normals,
             &activeScalingU, &activeScalingV);

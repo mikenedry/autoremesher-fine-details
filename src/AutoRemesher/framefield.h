@@ -29,11 +29,12 @@
 namespace AutoRemesher {
 
 class SurfaceMesh;
+struct SurfaceGuidance;
 
 class FrameField {
 public:
     static bool create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
-        std::vector<Vector3>* field);
+        std::vector<Vector3>* field, const SurfaceGuidance* guidance = nullptr, bool fixedCurvature = false);
 };
 }
 #endif

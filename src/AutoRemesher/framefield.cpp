@@ -1,3 +1,4 @@
+#include "surfaceanalysis.h"
 /*
  *  Copyright (c) 2026 Jeremy HU <jeremy-at-dust3d dot org>. All rights reserved.
  *
@@ -32,6 +33,8 @@
 
 namespace AutoRemesher {
 namespace {
+    // Fourfold field representation: Ray et al., N-Symmetry Direction Field Design (2008).
+    // https://doi.org/10.1145/1356682.1356683
     constexpr double kSymmetry = 4.0;
 
     struct FacetTangentBasis {
@@ -63,32 +66,16 @@ namespace {
         return std::atan2(Vector3::dotProduct(vector, basis.perpendicularTangent), Vector3::dotProduct(vector, basis.tangent));
     }
 
-    void accumulateCurvatureTensor(std::array<double, 6>* tensor, const Vector3& edge, double dihedral)
-    {
-        const Vector3 unitEdge = normalizedOrFallback(edge, Vector3(1, 0, 0));
-        const double weightedDihedral = edge.length() * dihedral;
-        (*tensor)[0] += weightedDihedral * unitEdge.x() * unitEdge.x();
-        (*tensor)[1] += weightedDihedral * unitEdge.x() * unitEdge.y();
-        (*tensor)[2] += weightedDihedral * unitEdge.y() * unitEdge.y();
-        (*tensor)[3] += weightedDihedral * unitEdge.x() * unitEdge.z();
-        (*tensor)[4] += weightedDihedral * unitEdge.y() * unitEdge.z();
-        (*tensor)[5] += weightedDihedral * unitEdge.z() * unitEdge.z();
-    }
-
-    Eigen::Matrix3d curvatureTensorMatrix(const std::array<double, 6>& coefficients)
-    {
-        Eigen::Matrix3d matrix;
-        matrix << coefficients[0], coefficients[1], coefficients[3], coefficients[1], coefficients[2], coefficients[4], coefficients[3], coefficients[4], coefficients[5];
-        return matrix;
-    }
 }
 
 bool FrameField::create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
-    std::vector<Vector3>* field)
+    std::vector<Vector3>* field, const SurfaceGuidance* guidance, bool fixedCurvature)
 {
     if (nullptr == field || mesh.faceCount() == 0)
         return false;
     const size_t faces = mesh.faceCount();
+    if (guidance && (guidance->faces.size() != faces || guidance->featureCorners.size() != mesh.cornerCount()))
+        return false;
     std::vector<FacetTangentBasis> facetBases(faces);
     tbb::parallel_for(tbb::blocked_range<size_t>(0, faces), [&](const tbb::blocked_range<size_t>& range) {
         for (size_t faceIndex = range.begin(); faceIndex != range.end(); ++faceIndex)
@@ -97,65 +84,20 @@ bool FrameField::create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
 
     std::vector<double> periodic(2 * faces, 0.0), certainty(faces, 0.0);
     std::vector<char> locked(faces, 0);
-    const double sharpRadians = sharpEdgeDegrees * M_PI / 180.0;
-    for (size_t faceIndex = 0; faceIndex < faces; ++faceIndex)
-        for (size_t cornerIndex = 3 * faceIndex; cornerIndex < 3 * faceIndex + 3; ++cornerIndex) {
-            const size_t oppositeCornerIndex = mesh.oppositeCorner(cornerIndex);
-            if (oppositeCornerIndex != SurfaceMesh::npos && std::fabs(mesh.normalAngle(cornerIndex)) <= sharpRadians)
-                continue;
-            const double fieldAngle = kSymmetry * tangentAngle(mesh.edgeVector(cornerIndex), facetBases[faceIndex]);
-            periodic[2 * faceIndex] = std::cos(fieldAngle);
-            periodic[2 * faceIndex + 1] = std::sin(fieldAngle);
-            locked[faceIndex] = 1;
-        }
-
-    std::vector<std::array<double, 6>> vertexTensor(mesh.vertexCount());
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, vertexTensor.size()), [&](const tbb::blocked_range<size_t>& range) {
-        for (size_t vertexIndex = range.begin(); vertexIndex != range.end(); ++vertexIndex)
-            vertexTensor[vertexIndex].fill(0.0);
-    });
-    for (size_t cornerIndex = 0; cornerIndex < mesh.cornerCount(); ++cornerIndex) {
-        const size_t oppositeCornerIndex = mesh.oppositeCorner(cornerIndex);
-        if (oppositeCornerIndex == SurfaceMesh::npos || oppositeCornerIndex < cornerIndex)
-            continue;
-        accumulateCurvatureTensor(&vertexTensor[mesh.cornerVertex(cornerIndex)], mesh.edgeVector(cornerIndex), mesh.normalAngle(cornerIndex));
-        accumulateCurvatureTensor(&vertexTensor[mesh.cornerVertex(mesh.nextCorner(cornerIndex))], mesh.edgeVector(cornerIndex), mesh.normalAngle(cornerIndex));
+    SurfaceGuidance local;
+    if (!guidance) {
+        SurfaceAnalysis analysis(mesh, mesh.averageEdgeLength(), sharpEdgeDegrees, 0, 0);
+        local = analysis.transfer(mesh);
+        guidance = &local;
     }
-    double maximumCertainty = 0.0;
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, faces), [&](const tbb::blocked_range<size_t>& range) {
-        for (size_t faceIndex = range.begin(); faceIndex != range.end(); ++faceIndex)
-            if (!locked[faceIndex]) {
-                std::array<double, 6> total {};
-                for (size_t cornerIndex = 3 * faceIndex; cornerIndex < 3 * faceIndex + 3; ++cornerIndex)
-                    for (size_t coefficientIndex = 0; coefficientIndex < 6; ++coefficientIndex)
-                        total[coefficientIndex] += vertexTensor[mesh.cornerVertex(cornerIndex)][coefficientIndex];
-                Eigen::Matrix3d tensor = curvatureTensorMatrix(total);
-                double trace = tensor(0, 0) + tensor(1, 1) + tensor(2, 2);
-                const double regularizer = trace == 0.0 ? 1e-6 : 1e-6 * trace;
-                tensor(0, 0) += regularizer;
-                tensor(1, 1) += regularizer;
-                tensor(2, 2) += regularizer;
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(tensor);
-                if (eig.info() != Eigen::Success)
-                    continue;
-                std::array<int, 3> ordered = { 0, 1, 2 };
-                std::sort(ordered.begin(), ordered.end(), [&](int a, int b) {
-                    return std::fabs(eig.eigenvalues()[a]) > std::fabs(eig.eigenvalues()[b]);
-                });
-                const int primaryEigenvectorIndex = ordered[0], secondaryEigenvectorIndex = ordered[1];
-                const Eigen::Vector3d direction = eig.eigenvectors().col(primaryEigenvectorIndex);
-                const Vector3 principalDirection(direction.x(), direction.y(), direction.z());
-                const double fieldAngle = kSymmetry * tangentAngle(principalDirection, facetBases[faceIndex]);
-                periodic[2 * faceIndex] = std::cos(fieldAngle);
-                periodic[2 * faceIndex + 1] = std::sin(fieldAngle);
-                certainty[faceIndex] = std::fabs(eig.eigenvalues()[primaryEigenvectorIndex] - eig.eigenvalues()[secondaryEigenvectorIndex]);
-            }
-    });
-    for (double certaintyValue : certainty)
-        maximumCertainty = std::max(maximumCertainty, certaintyValue);
-    if (maximumCertainty > 0.0)
-        for (double& certaintyValue : certainty)
-            certaintyValue /= maximumCertainty;
+    for (size_t f = 0; f < faces; ++f) {
+        const auto& face = guidance->faces[f];
+        const double angle = kSymmetry * tangentAngle(face.direction, facetBases[f]);
+        periodic[2 * f] = std::cos(angle);
+        periodic[2 * f + 1] = std::sin(angle);
+        certainty[f] = face.confidence;
+        locked[f] = face.confidence >= 1.0 && (fixedCurvature || guidance->featureCorners[3 * f] || guidance->featureCorners[3 * f + 1] || guidance->featureCorners[3 * f + 2]);
+    }
 
     const auto normalizePeriodic = [&]() {
         tbb::parallel_for(tbb::blocked_range<size_t>(0, faces), [&](const tbb::blocked_range<size_t>& range) {

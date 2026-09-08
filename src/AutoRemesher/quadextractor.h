@@ -32,6 +32,8 @@
 
 namespace AutoRemesher {
 
+class SurfaceAnalysis;
+
 class QuadExtractor {
 public:
     QuadExtractor(const std::vector<Vector3>* vertices,
@@ -48,7 +50,7 @@ public:
         return m_remeshedVertices;
     }
 
-    const std::vector<std::vector<size_t>>& remeshedQuads()
+    const std::vector<std::vector<size_t>>& remeshedQuads() const
     {
         return m_remeshedPolygons;
     }
@@ -81,6 +83,8 @@ public:
         return m_extractedConnectionMoved;
     }
 
+    void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
+    size_t constrainedCurveVertices() const { return m_curveVertices; }
     bool extract();
 
 private:
@@ -92,6 +96,8 @@ private:
         int integer = 0;
     };
 
+    const SurfaceAnalysis* m_analysis = nullptr;
+    size_t m_curveVertices = 0;
     const std::vector<Vector3>* m_vertices = nullptr;
     const std::vector<std::vector<size_t>>* m_triangles = nullptr;
     const std::vector<std::vector<Vector2>>* m_triangleUvs = nullptr;
