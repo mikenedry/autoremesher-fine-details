@@ -90,6 +90,99 @@ namespace {
     const double decimateTriggerRatio = 8.0;
     const double decimateTargetRatio = 4.0;
 
+    enum class PreparationRecovery { None,
+        Source,
+        Creases,
+        Diagonals };
+    bool preferFeatureLayout(QuadExtractor& before, QuadExtractor& after,
+        const SurfaceAnalysis& reference, double sourceArea, bool recoverConnectivity = false, PreparationRecovery preparation = PreparationRecovery::None)
+    {
+        const bool recoverPreparation = preparation == PreparationRecovery::Creases;
+        struct Quality {
+            double angle = 0, error = 0, area = 0, weight = 0;
+            size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0;
+        };
+        const auto measure = [&](QuadExtractor& mesh) {
+            Quality q;
+            const auto& points = mesh.remeshedVertices();
+            const auto& faces = mesh.remeshedQuads();
+            std::map<std::pair<size_t, size_t>, size_t> edges;
+            for (const auto& f : faces) {
+                Vector3 center;
+                double area = 0;
+                for (size_t v : f)
+                    center += points[v];
+                center /= double(f.size());
+                for (size_t k = 1; k + 1 < f.size(); ++k)
+                    area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
+                q.area += area;
+                q.error += area * reference.surfaceDistanceSquared(center);
+                if (f.size() != 4) {
+                    bool trim = false;
+                    for (size_t k = 0; k < f.size(); ++k)
+                        trim |= reference.onSourceBoundary((points[f[k]] + points[f[(k + 1) % f.size()]]) * .5);
+                    q.nonquads += !trim;
+                }
+                for (size_t k = 0; k < f.size(); ++k) {
+                    ++edges[std::minmax(f[k], f[(k + 1) % f.size()])];
+                    if (f.size() != 4)
+                        continue;
+                    const Vector3 a = points[f[(k + 3) % 4]] - points[f[k]], b = points[f[(k + 1) % 4]] - points[f[k]];
+                    q.angle += area * (a.lengthSquared() * b.lengthSquared() > 0 ? std::asin(std::min(1.0, std::fabs(Vector3::dotProduct(a.normalized(), b.normalized())))) : M_PI / 2);
+                    ++q.corners;
+                    q.weight += area;
+                }
+            }
+            // Authored holes and trimmed borders are geometry, not extraction defects.
+            for (const auto& e : edges) {
+                q.boundary += e.second == 1 && !reference.onSourceBoundary((points[e.first.first] + points[e.first.second]) * .5) && !reference.onSourceBoundary(points[e.first.first], points[e.first.second]);
+                q.nonmanifold += e.second > 2;
+                q.collapsed += (points[e.first.first] - points[e.first.second]).lengthSquared() <= std::pow(1e-10 * reference.length(), 2);
+            }
+            std::vector<std::vector<std::vector<size_t>>> parts;
+            MeshSeparator::splitToIslands(faces, parts);
+            // Numerical dust must not veto recovery of a complete source form.
+            for (const auto& part : parts) {
+                double area = 0;
+                for (const auto& f : part)
+                    for (size_t k = 1; k + 1 < f.size(); ++k)
+                        area += Vector3::area(points[f[0]], points[f[k]], points[f[k + 1]]);
+                q.parts += area > 1e-6 * sourceArea;
+            }
+            q.nonquads -= std::min(q.nonquads, mesh.poleTriangles());
+            q.angle = q.weight ? q.angle / q.weight : M_PI;
+            q.error = q.area > 0 ? q.error / q.area : std::numeric_limits<double>::infinity();
+            // A quad and its reversed copy enclose no surface; their angles
+            // cannot veto recovery of the original component.
+            if (faces.size() == 2 && faces[0].size() == 4 && faces[1].size() == 4) {
+                const auto& a = faces[0];
+                const auto& b = faces[1];
+                for (size_t k = 0; k < 4; ++k)
+                    if (a[0] == b[k] && a[1] == b[(k + 3) % 4] && a[2] == b[(k + 2) % 4] && a[3] == b[(k + 1) % 4])
+                        q.angle = M_PI;
+            }
+            q.error = .5 * (q.error + reference.missingSurfaceError(points, faces));
+            q.area = q.area > 0 && sourceArea > 0 ? std::fabs(std::log(q.area / sourceArea)) : std::numeric_limits<double>::infinity();
+            return q;
+        };
+        const auto a = measure(before), b = measure(after);
+        std::cerr << "Candidate quality (angle/error/area/boundary/parts/collapsed): "
+                  << a.angle << '/' << a.error << '/' << a.area << '/' << a.boundary << '/' << a.parts << '/' << a.collapsed << " -> "
+                  << b.angle << '/' << b.error << '/' << b.area << '/' << b.boundary << '/' << b.parts << '/' << b.collapsed << '\n';
+        // Small curved forms can disappear without losing much total area.
+        const bool recoverForm = a.area > .03 || (a.error > std::pow(.05 * reference.length(), 2) && b.error < a.error * .5 && b.boundary <= a.boundary);
+        // A large area/angle recovery may slightly raise centroid-sampled error.
+        // Bound this allowance to the diagonal proposal, with no new openings.
+        const bool recoverArea = preparation == PreparationRecovery::Diagonals && b.parts == 1 && b.area < a.area * .5 && b.angle < a.angle && b.boundary <= a.boundary;
+        const double fittingLimit = std::max(a.error * (recoverArea ? 1.05 : 1.), std::pow(.05 * reference.length(), 2));
+        return b.corners && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15))) && ((recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
+                   // A dense perforated layout must not veto a clean source surface
+                   // merely because its smaller faces have lower centroid error.
+                   (preparation != PreparationRecovery::None && a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < a.angle && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads <= a.nonquads) ||
+                   // Avoid buying tiny fitting gains with a needlessly dense flat grid.
+                   ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads));
+    }
+
     void markSharpEdgeVertices(const std::vector<Vector3>& vertices,
         const std::vector<unsigned int>& indices,
         double sharpEdgeRadians,
@@ -315,10 +408,13 @@ void AutoRemesher::resample(std::vector<Vector3>& vertices,
     const ProgressHandler* progressHandler,
     std::vector<Vector3>* decimatedVerticesOut,
     std::vector<std::vector<size_t>>* decimatedTrianglesOut,
-    const SurfaceAnalysis* analysis)
+    const SurfaceAnalysis* analysis, bool balanceDiagonals, bool preserveCreases)
 {
     auto t_decimateStart = std::chrono::high_resolution_clock::now();
-    decimateIfTooDense(vertices, triangles, voxelSize, sharpEdgeDegrees, islandIndex, decimationStats);
+    // Preserve preparation creases before curvature sampling (Remesher's 30-degree gate).
+    if (!(analysis && analysis->featureLayout()) || vertices.size() > 50000)
+        decimateIfTooDense(vertices, triangles, voxelSize,
+            preserveCreases ? std::min(30., sharpEdgeDegrees) : sharpEdgeDegrees, islandIndex, decimationStats);
     if (nullptr != decimationStats) {
         decimationStats->timeUs += std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now() - t_decimateStart)
@@ -332,11 +428,29 @@ void AutoRemesher::resample(std::vector<Vector3>& vertices,
 
     auto t_fieldStart = std::chrono::high_resolution_clock::now();
     std::vector<double> vertexTargetLengths;
-    if (adaptivity > 0.0 && analysis) {
+    if (adaptivity > 0.0 && analysis && !analysis->featureLayout()) {
         vertexTargetLengths.resize(vertices.size());
         tbb::parallel_for(size_t(0), vertices.size(), [&](size_t v) {
             vertexTargetLengths[v] = analysis->scalarSize(vertices[v]);
         });
+        // Bound preparation work using the isotropic collapse spacing (4/5 h).
+        // Remesher also separates its finite working budget from quad sizing.
+        double samples = 0;
+        for (const auto& t : triangles) {
+            double density = 0;
+            for (size_t v : t)
+                density += 1 / std::pow(.8 * vertexTargetLengths[v], 2);
+            samples += Vector3::area(vertices[t[0]], vertices[t[1]], vertices[t[2]]) * density / (3 * std::sqrt(3.) / 2);
+            // Long, skinny input triangles also pay for splitting their edges.
+            for (size_t k = 0; k < 3; ++k) {
+                const size_t a = t[k], b = t[(k + 1) % 3];
+                samples += .5 * std::max(0., std::ceil((vertices[a] - vertices[b]).length() / (4. / 3 * std::min(vertexTargetLengths[a], vertexTargetLengths[b]))) - 1);
+            }
+        }
+        std::cerr << "Preparation estimate island " << islandIndex << " vertices " << samples << "\n";
+        // Reserve the 25k feature trial from Remesher's 80k dense budget.
+        if (samples > 80000 - 25000)
+            vertexTargetLengths.clear();
     }
     if (nullptr != adaptiveFieldTimeUs) {
         *adaptiveFieldTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -350,6 +464,8 @@ void AutoRemesher::resample(std::vector<Vector3>& vertices,
     IsotropicRemesher isotropicRemesher(vertices, triangles);
     if (nullptr != progressHandler && *progressHandler)
         isotropicRemesher.setProgressHandler(*progressHandler);
+    isotropicRemesher.setRefineOnly(analysis && analysis->featureLayout());
+    isotropicRemesher.setBalanceDiagonals(balanceDiagonals);
     isotropicRemesher.setTargetEdgeLength(voxelSize);
     if (!vertexTargetLengths.empty())
         isotropicRemesher.setVertexTargetEdgeLengths(&vertexTargetLengths);
@@ -503,6 +619,8 @@ bool AutoRemesher::remesh()
         std::vector<Vector3> vertices;
         std::vector<std::vector<size_t>> triangles;
         double voxelSize;
+        double samplingLength = 0;
+        double targetQuads;
         double scaling;
         double adaptivity;
         double anisotropy;
@@ -558,7 +676,9 @@ bool AutoRemesher::remesh()
                 context.analysis.reset(new SurfaceAnalysis(sourceMesh, m_voxelSize,
                     m_sharpEdgeDegrees, m_adaptivity, m_anisotropy));
                 m_preparedIslands[islandIndex].analysis = context.analysis;
+                // Zero means use the parameterizer's default scale of one.
                 context.scaling = m_scaling > 0 ? m_scaling : 1.0;
+                context.targetQuads = calculateMeshArea(context.vertices, context.triangles) / (.86602540378 * m_voxelSize * m_voxelSize * context.scaling * context.scaling);
                 context.voxelSize = m_voxelSize;
                 context.adaptivity = m_adaptivity;
                 context.anisotropy = m_anisotropy;
@@ -566,6 +686,7 @@ bool AutoRemesher::remesh()
                 context.smoothNormalDegrees = m_smoothNormalDegrees;
             }
         });
+    std::vector<IslandContext> featureContexts = islandContexes;
     auto t_buildEnd = std::chrono::high_resolution_clock::now();
     if (nullptr != m_progressHandler)
         m_progressHandler(m_tag, parallelPhaseBegin, "Remeshing uniformly");
@@ -690,14 +811,38 @@ bool AutoRemesher::remesh()
                 m_decimatedVertices, m_decimatedTriangles);
         }
     }
+    // Remesher prepare/refinement_coordinator.cpp separates sampling density
+    // from the output quota; even a small request needs a resolved work surface.
+    const double requested = m_targetTriangleCount * .5;
+    const double samplingCount = std::max(3000., requested < 8000 ? requested : requested < 15000 ? 8000 + (requested - 8000) * 4 / 7
+                                                                                                  : 12000);
+    const double samplingLength = std::sqrt(calculateMeshArea(m_vertices, m_triangles) / samplingCount);
+    tbb::parallel_for(size_t(0), featureContexts.size(), [&](size_t i) {
+        auto& c = featureContexts[i];
+        // Remesher prepare/quota.cpp uses quad area, with a 20-cell spacing
+        // floor for small pieces in large requests or multi-part meshes.
+        c.voxelSize *= std::sqrt(std::sqrt(3.) / 2);
+        if (m_targetTriangleCount > 800 || featureContexts.size() > 2)
+            c.voxelSize = std::min(c.voxelSize, std::sqrt(calculateMeshArea(c.vertices, c.triangles) / 20));
+        c.analysis.reset(new SurfaceAnalysis(SurfaceMesh(c.vertices, c.triangles), c.voxelSize,
+            c.sharpEdgeDegrees, c.adaptivity, c.anisotropy, true, false));
+        c.samplingLength = std::min(c.voxelSize, samplingLength);
+        const auto start = std::chrono::high_resolution_clock::now();
+        resample(c.vertices, c.triangles, c.samplingLength, c.adaptivity, c.sharpEdgeDegrees, c.smoothNormalDegrees,
+            i, nullptr, &adaptiveFieldTime, nullptr, nullptr, nullptr, c.analysis.get());
+        resampleTime += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    });
     auto t_isotropicEnd = std::chrono::high_resolution_clock::now();
 
     class ParameterizationThread {
     public:
         size_t islandIndex = 0;
+        size_t feedbackBefore = 0;
+        bool feedbackRetried = false, feedbackAccepted = false;
         IslandContext* island = nullptr;
+        std::shared_ptr<IslandContext> preparationProposal;
         std::unique_ptr<Parameterizer> parameterizer;
-        std::unique_ptr<QuadExtractor> remesher;
+        std::unique_ptr<QuadExtractor> remesher, connectivityProposal;
         AutoRemesher* autoRemesher = nullptr;
         std::vector<std::vector<Vector2>> capturedUvs;
         std::vector<std::vector<Vector2>> capturedOriginalUvs;
@@ -720,10 +865,11 @@ bool AutoRemesher::remesh()
     public:
         SurfaceParameterizer(std::vector<ParameterizationThread>* parameterizationThreads,
             std::atomic<long long>* parameterizeTime,
-            std::atomic<long long>* extractTime)
+            std::atomic<long long>* extractTime, std::vector<IslandContext>* featureContexts)
             : m_parameterizationThreads(parameterizationThreads)
             , m_parameterizeTime(parameterizeTime)
             , m_extractTime(extractTime)
+            , m_featureContexts(featureContexts)
         {
         }
 
@@ -732,7 +878,9 @@ bool AutoRemesher::remesh()
             for (size_t i = range.begin(); i != range.end(); ++i) {
                 auto& thread = (*m_parameterizationThreads)[i];
 
+                bool layoutTrial = false, spacingRefinement = false;
                 const auto run = [&](double scaling) {
+                    const bool trial = layoutTrial;
                     auto t0 = std::chrono::high_resolution_clock::now();
 
                     const auto& vertices = thread.island->vertices;
@@ -741,26 +889,30 @@ bool AutoRemesher::remesh()
                     if (vertices.empty() || triangles.empty()) {
                         // Still retire the island, otherwise its share of the bar
                         // is never filled in and the total stalls short of the end.
-                        thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
+                        if (!trial)
+                            thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
                         return;
                     }
 
-                    thread.autoRemesher->updateProgress(thread.islandIndex, islandResampleEnd);
+                    if (!trial)
+                        thread.autoRemesher->updateProgress(thread.islandIndex, islandResampleEnd);
                     thread.parameterizer = std::make_unique<Parameterizer>(&vertices,
                         &triangles,
                         nullptr);
-                    thread.parameterizer->setProgressHandler(
-                        thread.autoRemesher->makeStageProgress(thread.islandIndex,
-                            islandResampleEnd, islandParameterizeEnd, 0.0f));
+                    if (!trial)
+                        thread.parameterizer->setProgressHandler(
+                            thread.autoRemesher->makeStageProgress(thread.islandIndex,
+                                islandResampleEnd, islandParameterizeEnd, 0.0f));
                     if (scaling > 0.0)
                         thread.parameterizer->setScaling(scaling);
                     thread.parameterizer->setSurfaceAnalysis(thread.island->analysis.get());
+                    thread.parameterizer->setSpacingRefinement(spacingRefinement);
                     thread.parameterizer->setGradientAdaptivity(thread.island->adaptivity);
                     thread.parameterizer->setAnisotropy(thread.island->anisotropy);
                     thread.parameterizer->setSharpEdgeDegrees(thread.island->sharpEdgeDegrees);
                     bool parameterizeSucceeded = true;
                     try {
-                        parameterizeSucceeded = thread.parameterizer->parameterize();
+                        parameterizeSucceeded = thread.parameterizer->parameterize(layoutTrial);
                     } catch (const std::exception& e) {
                         // A pathological island must not abort the whole remesh,
                         // so log the parameterizer failure and skip its quads.
@@ -778,7 +930,8 @@ bool AutoRemesher::remesh()
                     *m_parameterizeTime += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
                     if (parameterizeSucceeded) {
-                        thread.autoRemesher->updateProgress(thread.islandIndex, islandParameterizeEnd);
+                        if (!trial)
+                            thread.autoRemesher->updateProgress(thread.islandIndex, islandParameterizeEnd);
                         std::unique_ptr<std::vector<std::vector<Vector2>>> uvs = thread.parameterizer->takeTriangleUvs();
                         if (uvs) {
                             // Save a copy of UVs for the [param] preview overlay
@@ -795,26 +948,154 @@ bool AutoRemesher::remesh()
                         thread.remesher->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
                         thread.remesher->setSingularVertices(&thread.capturedSingularVertexIndices);
                         thread.remesher->setFullTurnVertices(&thread.parameterizer->fullTurnVertices());
-                        thread.remesher->setProgressHandler(
-                            thread.autoRemesher->makeStageProgress(thread.islandIndex,
-                                islandParameterizeEnd, 1.0f, 1.0f));
-                        if (!thread.remesher->extract()) {
+                        if (!trial)
+                            thread.remesher->setProgressHandler(
+                                thread.autoRemesher->makeStageProgress(thread.islandIndex,
+                                    islandParameterizeEnd, 1.0f, 1.0f));
+                        if (!thread.remesher->extract(false, bool(thread.preparationProposal))) {
                             thread.remesher.reset();
                         } else {
+                            // Preserve the original source extraction. Only disconnected
+                            // results need a source-supported proposal on the same UVs.
+                            if (thread.island->analysis->featureLayout()) {
+                                std::vector<std::vector<std::vector<size_t>>> parts;
+                                MeshSeparator::splitToIslands(thread.remesher->remeshedQuads(), parts);
+                                if (parts.size() > 1) {
+                                    auto supported = std::make_unique<QuadExtractor>(&vertices, &triangles, uvs.get());
+                                    supported->setSurfaceAnalysis(thread.island->analysis.get());
+                                    supported->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
+                                    supported->setSingularVertices(&thread.capturedSingularVertexIndices);
+                                    supported->setFullTurnVertices(&thread.parameterizer->fullTurnVertices());
+                                    if (supported->extract(true, bool(thread.preparationProposal)))
+                                        thread.connectivityProposal = std::move(supported);
+                                }
+                            }
                             thread.capturedExtractedConnections = thread.remesher->extractedConnections();
                             thread.capturedExtractedConnectionMoved = thread.remesher->extractedConnectionMoved();
                         }
                     }
-                    thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
+                    if (!trial)
+                        thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
                     auto t2 = std::chrono::high_resolution_clock::now();
                     *m_extractTime += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
                 };
                 run(thread.island->scaling);
+                const auto feedback = [&]() {
+                    if (!thread.remesher)
+                        return;
+                    const auto quadCount = [](const QuadExtractor& mesh) {
+                        const auto& faces = mesh.remeshedQuads();
+                        return std::count_if(faces.begin(), faces.end(), [](const std::vector<size_t>& f) { return f.size() == 4; });
+                    };
+                    const double target = thread.island->targetQuads;
+                    const double before = quadCount(*thread.remesher);
+                    if (target < 16 || before == 0 || std::fabs(std::log(before / target)) < .15)
+                        return;
+                    // Curvature imposes a physical resolution requirement; count
+                    // feedback may refine it, but must not coarsen it away.
+                    if (thread.island->adaptivity > 0 && before > target)
+                        return;
+                    // One bounded correction on the already prepared island. Keep
+                    // the first delivery if the retry fails or worsens count/topology.
+                    const auto defects = [](const QuadExtractor& mesh) {
+                        std::map<std::pair<size_t, size_t>, size_t> edges;
+                        for (const auto& f : mesh.remeshedQuads())
+                            for (size_t k = 0; k < f.size(); ++k)
+                                ++edges[std::minmax(f[k], f[(k + 1) % f.size()])];
+                        std::vector<std::vector<std::vector<size_t>>> components;
+                        MeshSeparator::splitToIslands(mesh.remeshedQuads(), components);
+                        std::array<size_t, 3> result { { 0, 0, components.size() } };
+                        for (const auto& e : edges) {
+                            result[0] += e.second == 1;
+                            result[1] += e.second > 2;
+                        }
+                        return result;
+                    };
+                    auto saved = std::move(thread);
+                    thread = ParameterizationThread();
+                    thread.island = saved.island;
+                    thread.islandIndex = saved.islandIndex;
+                    thread.autoRemesher = saved.autoRemesher;
+                    run(thread.island->scaling * std::max(.8, std::min(1.25, std::sqrt(before / target))));
+                    bool accepted = false;
+                    if (thread.remesher && quadCount(*thread.remesher) > 0) {
+                        const auto first = defects(*saved.remesher), second = defects(*thread.remesher);
+                        accepted = std::fabs(std::log(quadCount(*thread.remesher) / target)) < std::fabs(std::log(before / target)) && second[0] <= first[0] && second[1] <= first[1] && second[2] == first[2];
+                    }
+                    if (!accepted)
+                        thread = std::move(saved);
+                    thread.feedbackBefore = before;
+                    thread.feedbackRetried = true;
+                    thread.feedbackAccepted = accepted;
+                };
+                feedback();
+                layoutTrial = true;
+                // Keep the baseline winner; one extra solve tests final-frame spacing
+                // on the same prepared source under the unchanged quality checks.
+                bool sourceLayoutAccepted = false;
+                for (size_t variant = 0; variant < 5; ++variant) {
+                    std::shared_ptr<IslandContext> crease;
+                    if (variant == 3) {
+                        // Preserve successful source layouts. Only failed source trials
+                        // need a different preparation triangulation before the solve.
+                        if (sourceLayoutAccepted)
+                            continue;
+                        auto& c = (*m_featureContexts)[i];
+                        const auto& source = *thread.autoRemesher->m_preparedIslands[i].reference;
+                        c.vertices = source.vertices;
+                        c.triangles = source.triangles;
+                        resample(c.vertices, c.triangles, c.samplingLength, c.adaptivity,
+                            c.sharpEdgeDegrees, c.smoothNormalDegrees, i, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, c.analysis.get(), true);
+                    }
+                    if (variant == 4) {
+                        const auto& source = *thread.autoRemesher->m_preparedIslands[i].reference;
+                        if (source.vertices.size() <= 50000)
+                            break;
+                        // Keep an accepted source layout alive while testing preparation.
+                        crease = std::make_shared<IslandContext>((*m_featureContexts)[i]);
+                        crease->vertices = source.vertices;
+                        crease->triangles = source.triangles;
+                        resample(crease->vertices, crease->triangles, crease->samplingLength, crease->adaptivity,
+                            crease->sharpEdgeDegrees, crease->smoothNormalDegrees, i, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, crease->analysis.get(), false, true);
+                    }
+                    spacingRefinement = variant == 2 || variant == 3;
+                    auto saved = std::move(thread);
+                    thread = ParameterizationThread();
+                    thread.preparationProposal = std::move(crease);
+                    thread.island = thread.preparationProposal ? thread.preparationProposal.get() : variant ? &(*m_featureContexts)[i]
+                                                                                                            : saved.island;
+                    thread.islandIndex = saved.islandIndex;
+                    thread.autoRemesher = saved.autoRemesher;
+                    run(thread.island->scaling);
+                    const auto& reference = *thread.autoRemesher->m_preparedIslands[i].reference;
+                    const double sourceArea = calculateMeshArea(reference.vertices, reference.triangles);
+                    const auto recovery = variant == 4 ? PreparationRecovery::Creases : variant == 3 ? PreparationRecovery::Diagonals
+                        : variant                                                                    ? PreparationRecovery::Source
+                                                                                                     : PreparationRecovery::None;
+                    bool accepted = thread.remesher && (!saved.remesher || preferFeatureLayout(*saved.remesher, *thread.remesher, *saved.island->analysis, sourceArea, false, recovery));
+                    // Test both extractions against the retained winner: a local choice
+                    // must not discard a source layout that beats the previous trial.
+                    auto* winner = accepted ? thread.remesher.get() : saved.remesher.get();
+                    if (thread.connectivityProposal && (!winner || preferFeatureLayout(*winner, *thread.connectivityProposal, *saved.island->analysis, sourceArea, true, recovery))) {
+                        thread.remesher = std::move(thread.connectivityProposal);
+                        accepted = true;
+                        thread.capturedExtractedConnections = thread.remesher->extractedConnections();
+                        thread.capturedExtractedConnectionMoved = thread.remesher->extractedConnectionMoved();
+                    }
+                    thread.connectivityProposal.reset();
+                    std::cerr << "Feature layout island " << i << " variant " << variant << " accepted " << accepted << '\n';
+                    sourceLayoutAccepted |= variant > 0 && accepted;
+                    if (!accepted)
+                        thread = std::move(saved);
+                }
             }
         }
 
     private:
         std::vector<ParameterizationThread>* m_parameterizationThreads = nullptr;
+        std::vector<IslandContext>* m_featureContexts = nullptr;
         std::atomic<long long>* m_parameterizeTime = nullptr;
         std::atomic<long long>* m_extractTime = nullptr;
     };
@@ -824,23 +1105,37 @@ bool AutoRemesher::remesh()
     tbb::parallel_for(tbb::blocked_range<size_t>(0, parameterizationThreads.size()),
         SurfaceParameterizer(&parameterizationThreads,
             &parameterizeTimeAccumulated,
-            &extractTimeAccumulated));
+            &extractTimeAccumulated, &featureContexts));
     auto t_parallelEnd = std::chrono::high_resolution_clock::now();
 
     if (nullptr != m_progressHandler)
         m_progressHandler(m_tag, parallelPhaseEnd, "Merging mesh islands");
 
-    // Merge isotropic UVs from all islands (for [param] preview)
+    m_isotropicVertices.clear();
+    m_isotropicTriangles.clear();
     m_isotropicTriangleUvs.clear();
     m_isotropicOriginalTriangleUvs.clear();
     for (size_t i = 0; i < parameterizationThreads.size(); ++i) {
-        auto& thread = parameterizationThreads[i];
-        if (thread.capturedUvs.empty())
-            continue;
-        m_isotropicTriangleUvs.insert(m_isotropicTriangleUvs.end(),
-            thread.capturedUvs.begin(), thread.capturedUvs.end());
-        m_isotropicOriginalTriangleUvs.insert(m_isotropicOriginalTriangleUvs.end(),
-            thread.capturedOriginalUvs.begin(), thread.capturedOriginalUvs.end());
+        const auto& thread = parameterizationThreads[i];
+        const auto& c = *thread.island;
+        auto& prepared = m_preparedIslands[i];
+        prepared.analysis = c.analysis;
+        prepared.vertexOffset = m_isotropicVertices.size();
+        prepared.vertexCount = c.vertices.size();
+        prepared.triangleOffset = m_isotropicTriangles.size();
+        prepared.triangleCount = c.triangles.size();
+        m_isotropicVertices.insert(m_isotropicVertices.end(), c.vertices.begin(), c.vertices.end());
+        for (auto f : c.triangles) {
+            for (auto& v : f)
+                v += prepared.vertexOffset;
+            m_isotropicTriangles.push_back(std::move(f));
+        }
+        m_isotropicTriangleUvs.resize(m_isotropicTriangles.size(), std::vector<Vector2>(3));
+        m_isotropicOriginalTriangleUvs.resize(m_isotropicTriangles.size(), std::vector<Vector2>(3));
+        if (thread.capturedUvs.size() == c.triangles.size())
+            std::copy(thread.capturedUvs.begin(), thread.capturedUvs.end(), m_isotropicTriangleUvs.begin() + prepared.triangleOffset);
+        if (thread.capturedOriginalUvs.size() == c.triangles.size())
+            std::copy(thread.capturedOriginalUvs.begin(), thread.capturedOriginalUvs.end(), m_isotropicOriginalTriangleUvs.begin() + prepared.triangleOffset);
     }
 
     // Merge singular vertex positions from all islands (for [param] preview)
@@ -872,6 +1167,12 @@ bool AutoRemesher::remesh()
         auto& thread = parameterizationThreads[i];
         if (nullptr == thread.remesher)
             continue;
+        if (thread.feedbackRetried) {
+            const auto& faces = thread.remesher->remeshedQuads();
+            const size_t count = std::count_if(faces.begin(), faces.end(), [](const std::vector<size_t>& f) { return f.size() == 4; });
+            std::cerr << "Count feedback: " << thread.feedbackBefore << " -> " << count
+                      << " target " << thread.island->targetQuads << " accepted " << thread.feedbackAccepted << '\n';
+        }
         curveVertices += thread.remesher->constrainedCurveVertices();
         const auto& quads = thread.remesher->remeshedQuads();
         if (quads.empty())

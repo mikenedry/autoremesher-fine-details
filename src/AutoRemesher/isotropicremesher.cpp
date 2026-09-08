@@ -44,12 +44,32 @@ bool IsotropicRemesher::remesh()
     remesher.setSmoothNormalDegrees(m_smoothNormalDegrees);
     if (m_progressHandler)
         remesher.setProgressHandler(m_progressHandler);
-    remesher.remesh(m_remeshIterations);
+    // Bound the feature trial to half Remesher's 50,000-point working budget.
+    if (m_refineOnly)
+        remesher.setRefinementVertexLimit(25000);
+    remesher.remesh(m_refineOnly ? 0 : m_remeshIterations);
 
     IsotropicHalfedgeMesh* halfedgeMesh = remesher.remeshedHalfedgeMesh();
     if (nullptr == halfedgeMesh)
         return false;
 
+    // Remesher prepare/refinement_coordinator.cpp balances diagonals before
+    // field measurement. Reuse our flip guard only on coplanar source patches.
+    if (m_refineOnly && m_balanceDiagonals) {
+        halfedgeMesh->updateTriangleNormals();
+        for (auto* face = halfedgeMesh->moveToNextFace(nullptr); face;) {
+            auto* start = face->halfedge;
+            face = halfedgeMesh->moveToNextFace(face);
+            auto* edge = start;
+            do {
+                auto* next = edge->nextHalfedge;
+                auto* other = edge->oppositeHalfedge;
+                if (other && ::Vector3::dotProduct(edge->leftFace->_normal, other->leftFace->_normal) > 1 - 1e-10 && halfedgeMesh->flipEdge(edge))
+                    break;
+                edge = next;
+            } while (edge != start);
+        }
+    }
     size_t outputIndex = 0;
     for (IsotropicHalfedgeMesh::Vertex* vertex = halfedgeMesh->moveToNextVertex(nullptr);
         nullptr != vertex;

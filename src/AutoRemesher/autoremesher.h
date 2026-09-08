@@ -294,7 +294,7 @@ private:
         const ProgressHandler* progressHandler,
         std::vector<Vector3>* decimatedVerticesOut,
         std::vector<std::vector<size_t>>* decimatedTrianglesOut,
-        const SurfaceAnalysis* analysis);
+        const SurfaceAnalysis* analysis, bool balanceDiagonals = false, bool preserveCreases = false);
     static double calculateMeshArea(const std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& triangles);
 };

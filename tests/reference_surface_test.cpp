@@ -57,6 +57,71 @@ static std::map<std::pair<size_t, size_t>, size_t> edgeUses(const Faces& faces)
     return uses;
 }
 
+static void balancedRefinement()
+{
+    // A folded strip with alternating diagonals has avoidable 4/8-valence
+    // fans. Refinement may balance its planar patches, preserving the crease.
+    std::vector<Vec3> vertices;
+    Faces triangles;
+    for (size_t y = 0; y < 5; ++y)
+        for (size_t x = 0; x < 7; ++x)
+            vertices.emplace_back(double(x), double(std::min(y, size_t(2))), double(y > 2 ? y - 2 : 0));
+    for (size_t y = 0; y < 4; ++y)
+        for (size_t x = 0; x < 6; ++x) {
+            const size_t a = y * 7 + x, b = a + 1, c = a + 7, d = c + 1;
+            if ((x + y) % 2) {
+                triangles.push_back({ a, b, c });
+                triangles.push_back({ b, d, c });
+            } else {
+                triangles.push_back({ a, b, d });
+                triangles.push_back({ a, d, c });
+            }
+        }
+    const auto defect = [&](const Faces& faces) {
+        const auto uses = edgeUses(faces);
+        std::vector<size_t> valence(vertices.size());
+        std::set<size_t> boundary;
+        for (const auto& e : uses) {
+            ++valence[e.first.first];
+            ++valence[e.first.second];
+            if (e.second == 1) {
+                boundary.insert(e.first.first);
+                boundary.insert(e.first.second);
+            }
+        }
+        double result = 0;
+        for (size_t v = 0; v < valence.size(); ++v)
+            result += std::pow(double(valence[v]) - (boundary.count(v) ? 4 : 6), 2);
+        return result;
+    };
+    AutoRemesher::IsotropicRemesher remesher(vertices, triangles);
+    remesher.setRefineOnly(true);
+    remesher.setBalanceDiagonals(true);
+    remesher.setTargetEdgeLength(10);
+    remesher.setSharpEdgeDegrees(90);
+    require(remesher.remesh(), "strip refinement failed");
+    const auto& out = remesher.remeshedVertices();
+    const auto& faces = remesher.remeshedTriangles();
+    require(out.size() == vertices.size() && faces.size() == triangles.size(), "diagonal balancing changed counts");
+    for (size_t v = 0; v < out.size(); ++v)
+        require((out[v] - vertices[v]).lengthSquared() == 0, "diagonal balancing moved a point");
+    require(defect(faces) < defect(triangles), "refinement left avoidable diagonal fans");
+    const auto before = edgeUses(triangles), after = edgeUses(faces);
+    for (const auto& e : before)
+        if (e.second == 1 || (e.first.first / 7 == 2 && e.first.second / 7 == 2)) {
+            const auto found = after.find(e.first);
+            require(found != after.end() && found->second == e.second, "balancing changed boundary or crease");
+        }
+    double area = 0;
+    for (const auto& f : faces) {
+        const Vec3 n = Vec3::crossProduct(out[f[1]] - out[f[0]], out[f[2]] - out[f[0]]);
+        require(n.lengthSquared() > 0, "balancing created degenerate triangle");
+        require((n.x() == 0 && n.y() == 0 && n.z() > 0) || (n.x() == 0 && n.y() < 0 && n.z() == 0), "balancing crossed folded sheets");
+        area += .5 * n.length();
+    }
+    require(std::fabs(area - 24) < 1e-12, "balancing changed source area");
+}
+
 static void checkReferences(Remesher& remesher, const std::vector<Vec3>& vertices,
     const Faces& faces)
 {
@@ -104,6 +169,7 @@ static void checkReferences(Remesher& remesher, const std::vector<Vec3>& vertice
         require(seen, "source triangle missing after preparation");
     require(vertexOffset == remesher.isotropicVertices().size(), "unmapped working vertices");
     require(triangleOffset == remesher.isotropicTriangles().size(), "unmapped working triangles");
+    require(remesher.isotropicTriangleUvs().size() == triangleOffset, "selected candidate UV ranges do not match preparation");
 }
 
 static void fixtures()
@@ -612,10 +678,35 @@ static void radialCover()
     }
 }
 
+static void boundedRefinement()
+{
+    std::vector<::Vector3> points { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 } };
+    Faces triangles { { 0, 1, 2 }, { 0, 2, 3 } };
+    for (size_t limit : { size_t(3), size_t(80) }) {
+        ::IsotropicRemesher remesher(&points, &triangles);
+        remesher.setTargetEdgeLength(.001);
+        remesher.setRefinementVertexLimit(limit);
+        remesher.remesh(0);
+        auto* mesh = remesher.remeshedHalfedgeMesh();
+        size_t count = 0;
+        double area = 0;
+        for (auto* v = mesh->moveToNextVertex(nullptr); v; v = mesh->moveToNextVertex(v))
+            ++count;
+        for (auto* f = mesh->moveToNextFace(nullptr); f; f = mesh->moveToNextFace(f)) {
+            auto* e = f->halfedge;
+            area += ::Vector3::area(e->startVertex->position, e->nextHalfedge->startVertex->position, e->previousHalfedge->startVertex->position);
+        }
+        require(count == std::max(points.size(), limit), "refinement exceeded its vertex budget or deleted original geometry");
+        require(std::fabs(area - 1) < 1e-12, "budget stop lost source coverage");
+    }
+}
+
 int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
+            boundedRefinement();
+            balancedRefinement();
             fixtures();
             tinyIsland();
             thinTubeCleanup();
