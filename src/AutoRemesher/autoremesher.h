@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -46,6 +47,36 @@ typedef void (*AutoRemesherProgressHandler)(void* tag, float progress, const cha
 
 class AutoRemesher {
 public:
+    // Snapshot before simplification/resampling. Triangle indices address this
+    // snapshot's vertices; source IDs address the constructor's original input.
+    struct ReferenceSurface {
+        enum class EdgeFeature : uint8_t { None,
+            Boundary,
+            Sharp };
+        std::vector<Vector3> vertices;
+        std::vector<std::vector<size_t>> triangles;
+        std::vector<size_t> sourceVertexIds;
+        std::vector<size_t> sourceTriangleIds;
+        // One entry per triangle corner, for its outgoing edge. Boundary also
+        // includes edges detached by the existing SurfaceMesh topology rules.
+        std::vector<EdgeFeature> edgeFeatures;
+        double sharpEdgeDegrees = 0.0;
+    };
+
+    struct PreparedIsland {
+        std::shared_ptr<const ReferenceSurface> reference;
+        // Ranges in isotropicVertices()/isotropicTriangles(), after merging.
+        size_t vertexOffset = 0;
+        size_t vertexCount = 0;
+        size_t triangleOffset = 0;
+        size_t triangleCount = 0;
+    };
+
+    const std::vector<PreparedIsland>& preparedIslands() const
+    {
+        return m_preparedIslands;
+    }
+
     AutoRemesher(const std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& triangles)
         : m_vertices(vertices)
@@ -197,8 +228,9 @@ public:
     };
 
 private:
-    std::vector<Vector3> m_vertices;
-    std::vector<std::vector<size_t>> m_triangles;
+    const std::vector<Vector3> m_vertices;
+    const std::vector<std::vector<size_t>> m_triangles;
+    std::vector<PreparedIsland> m_preparedIslands;
     std::vector<Vector3> m_remeshedVertices;
     std::vector<std::vector<size_t>> m_remeshedQuads;
     std::vector<Vector3> m_decimatedVertices;

@@ -92,7 +92,8 @@ namespace {
 }
 
 void MeshSeparator::splitToIslands(const std::vector<std::vector<size_t>>& faces,
-    std::vector<std::vector<std::vector<size_t>>>& islands)
+    std::vector<std::vector<std::vector<size_t>>>& islands,
+    std::vector<std::vector<size_t>>* sourceFaceIds)
 {
     std::vector<std::pair<uint64_t, size_t>> packedEdgeToFace;
     std::map<std::pair<size_t, size_t>, size_t> edgeToFaceMap;
@@ -116,6 +117,7 @@ void MeshSeparator::splitToIslands(const std::vector<std::vector<size_t>>& faces
             continue;
         waitFaces.push(indexInGroup);
         std::vector<std::vector<size_t>> island;
+        std::vector<size_t> islandFaceIds;
         while (!waitFaces.empty()) {
             size_t index = waitFaces.front();
             waitFaces.pop();
@@ -130,11 +132,15 @@ void MeshSeparator::splitToIslands(const std::vector<std::vector<size_t>>& faces
                 waitFaces.push(oppositeFace);
             }
             island.push_back(faces[index]);
+            if (sourceFaceIds)
+                islandFaceIds.push_back(index);
             processedFaces[index] = 1;
         }
         if (island.empty())
             continue;
         islands.push_back(std::move(island));
+        if (sourceFaceIds)
+            sourceFaceIds->push_back(std::move(islandFaceIds));
     }
 }
 

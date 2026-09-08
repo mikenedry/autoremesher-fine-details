@@ -24,6 +24,7 @@
 #include <AutoRemesher/MeshSeparator>
 #include <AutoRemesher/Parameterizer>
 #include <AutoRemesher/QuadExtractor>
+#include <AutoRemesher/SurfaceMesh>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -547,6 +548,24 @@ void AutoRemesher::accumulateStageTime(const char* name, float order, long long 
 
 bool AutoRemesher::remesh()
 {
+    // Each run owns a fresh delivery, including when validation fails.
+    m_preparedIslands.clear();
+    m_remeshedVertices.clear();
+    m_remeshedQuads.clear();
+    m_decimatedVertices.clear();
+    m_decimatedTriangles.clear();
+    m_decimated = false;
+    m_isotropicVertices.clear();
+    m_isotropicTriangles.clear();
+    m_isotropicTriangleUvs.clear();
+    m_isotropicOriginalTriangleUvs.clear();
+    m_isotropicSingularVertices.clear();
+    m_isotropicExtractedConnections.clear();
+    m_isotropicExtractedConnectionMoved.clear();
+    m_phaseReport.clear();
+    m_stageTimes.clear();
+    m_reportedPermille = -1;
+    m_reportedStatus = nullptr;
     // Validate inputs before any sizing math. In particular a zero target
     // triangle count would divide by zero in initializeVoxelSize().
     const char* invalidInputReason = nullptr;
@@ -575,8 +594,9 @@ bool AutoRemesher::remesh()
     if (nullptr != m_progressHandler)
         m_progressHandler(m_tag, 0.01f, "Splitting mesh into islands");
     std::vector<std::vector<std::vector<size_t>>> trianglesIslands;
+    std::vector<std::vector<size_t>> sourceTriangleIds;
     auto t_splitStart = std::chrono::high_resolution_clock::now();
-    MeshSeparator::splitToIslands(m_triangles, trianglesIslands);
+    MeshSeparator::splitToIslands(m_triangles, trianglesIslands, &sourceTriangleIds);
     auto t_afterSplit = std::chrono::high_resolution_clock::now();
 
     if (trianglesIslands.empty()) {
@@ -606,11 +626,14 @@ bool AutoRemesher::remesh()
     // Islands are compacted independently of each other, and writing into a
     // pre-sized vector by index keeps them in the original order.
     std::vector<IslandContext> islandContexes(trianglesIslands.size());
+    m_preparedIslands.resize(trianglesIslands.size());
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trianglesIslands.size()),
         [&](const tbb::blocked_range<size_t>& range) {
             for (size_t islandIndex = range.begin(); islandIndex != range.end(); ++islandIndex) {
                 const auto& island = trianglesIslands[islandIndex];
                 IslandContext& context = islandContexes[islandIndex];
+                ReferenceSurface reference;
+                reference.sourceTriangleIds = std::move(sourceTriangleIds[islandIndex]);
                 context.triangles.reserve(island.size());
                 std::unordered_map<size_t, size_t> oldToNewVertexMap;
                 oldToNewVertexMap.reserve(island.size() * 2);
@@ -619,12 +642,29 @@ bool AutoRemesher::remesh()
                     triangle.reserve(3);
                     for (size_t i = 0; i < 3; ++i) {
                         auto insertResult = oldToNewVertexMap.insert({ face[i], context.vertices.size() });
-                        if (insertResult.second)
+                        if (insertResult.second) {
                             context.vertices.push_back(m_vertices[face[i]]);
+                            reference.sourceVertexIds.push_back(face[i]);
+                        }
                         triangle.push_back(insertResult.first->second);
                     }
                     context.triangles.push_back(std::move(triangle));
                 }
+
+                reference.vertices = context.vertices;
+                reference.triangles = context.triangles;
+                reference.sharpEdgeDegrees = m_sharpEdgeDegrees;
+                const SurfaceMesh sourceMesh(reference.vertices, reference.triangles);
+                reference.edgeFeatures.resize(sourceMesh.cornerCount(), ReferenceSurface::EdgeFeature::None);
+                const double sharpRadians = m_sharpEdgeDegrees * M_PI / 180.0;
+                for (size_t corner = 0; corner < sourceMesh.cornerCount(); ++corner) {
+                    if (sourceMesh.isBoundaryCorner(corner))
+                        reference.edgeFeatures[corner] = ReferenceSurface::EdgeFeature::Boundary;
+                    else if (std::fabs(sourceMesh.normalAngle(corner)) > sharpRadians)
+                        reference.edgeFeatures[corner] = ReferenceSurface::EdgeFeature::Sharp;
+                }
+                // No mutable owner remains once this snapshot is published.
+                m_preparedIslands[islandIndex].reference = std::make_shared<const ReferenceSurface>(std::move(reference));
 
                 context.scaling = m_scaling;
                 context.voxelSize = m_voxelSize;
@@ -740,6 +780,16 @@ bool AutoRemesher::remesh()
                 &decimationStats,
                 &isotropicIslandVertices, &isotropicIslandTriangles,
                 &decimatedIslandVertices, &decimatedIslandTriangles));
+        size_t vertexOffset = 0, triangleOffset = 0;
+        for (size_t i = 0; i < m_preparedIslands.size(); ++i) {
+            auto& prepared = m_preparedIslands[i];
+            prepared.vertexOffset = vertexOffset;
+            prepared.vertexCount = isotropicIslandVertices[i].size();
+            prepared.triangleOffset = triangleOffset;
+            prepared.triangleCount = isotropicIslandTriangles[i].size();
+            vertexOffset += prepared.vertexCount;
+            triangleOffset += prepared.triangleCount;
+        }
         mergeIslands(isotropicIslandVertices, isotropicIslandTriangles,
             m_isotropicVertices, m_isotropicTriangles);
         m_decimated = decimationStats.islandsDecimated.load() > 0;
