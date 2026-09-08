@@ -56,7 +56,8 @@ public:
     void addEnergy(size_t firstVariable, double firstCoefficient,
         size_t secondVariable, double secondCoefficient, double rhs, double weight = 1.0);
 
-    bool solveIteration();
+    bool solveIteration(bool round = true, bool budgeted = false);
+    bool separateIntegerCoordinates(size_t first, size_t second, double difference);
     bool converged() const;
     double value(size_t originalVariable) const;
     size_t kernelSize() const;
@@ -85,6 +86,7 @@ private:
     std::vector<Coeff> line(size_t originalVariable) const;
     const std::vector<Coeff>& kernelLine(size_t originalVariable) const;
     void buildKernel();
+    void admitRoundingBatch();
     std::vector<Coeff> throughM0(const std::vector<Coeff>& row) const;
     std::vector<Coeff> throughM1(const std::vector<Coeff>& row) const;
     bool processConstraint(const std::vector<Coeff>& row);
@@ -114,6 +116,8 @@ private:
     std::vector<Row> m_reducedEnergy;
     std::vector<double> m_values;
     std::vector<bool> m_fixed;
+    std::vector<Row> m_separations;
+    std::vector<int> m_separationPeriods;
 
     SparseMatrix m_kernel;
     bool m_kernelBuilt = false;

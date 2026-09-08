@@ -29,6 +29,7 @@
 #include <vector>
 
 namespace AutoRemesher {
+struct SurfaceGuidance;
 
 class QuadParameterizer {
 public:
@@ -37,6 +38,7 @@ public:
         std::vector<Vector3> field;
         std::vector<int> cornerRotations;
         std::vector<size_t> singularVertices;
+        std::vector<size_t> fullTurnVertices;
     };
     static bool parameterize(const std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& triangles,
@@ -48,7 +50,8 @@ public:
         // Reports 0..1 across the quad cover solve, which is the single longest
         // step of the whole pipeline and would otherwise be one silent block.
         const ProgressHandler* progressHandler = nullptr,
-        const std::vector<char>* featureCorners = nullptr);
+        const std::vector<char>* featureCorners = nullptr, bool featureLayout = false,
+        const SurfaceGuidance* sizing = nullptr);
 };
 
 }

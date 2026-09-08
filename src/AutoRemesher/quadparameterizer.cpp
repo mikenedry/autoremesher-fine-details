@@ -22,12 +22,15 @@
 #include <AutoRemesher/ConstrainedLeastSquares>
 #include <AutoRemesher/MixedIntegerLeastSquares>
 #include <AutoRemesher/QuadParameterizer>
+#include <AutoRemesher/SurfaceAnalysis>
 #include <AutoRemesher/SurfaceMesh>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <queue>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -79,7 +82,7 @@ namespace {
         ConstraintV = 2 };
     int edgeConstraint(const SurfaceMesh& mesh, size_t c, const std::vector<Vector3>& field,
         const std::vector<Vector3>& normals, double hardEdgeDegrees,
-        const std::vector<char>* featureCorners)
+        const std::vector<char>* featureCorners, bool nearestAxis = false)
     {
         if (!(featureCorners && (*featureCorners)[c]) && mesh.oppositeCorner(c) != SurfaceMesh::npos && std::fabs(mesh.normalAngle(c)) * 180.0 / M_PI < hardEdgeDegrees)
             return ConstraintNone;
@@ -87,6 +90,10 @@ namespace {
         const Vector3 edge = unit(mesh.edgeVector(c), Vector3(1, 0, 0));
         const Vector3 b = unit(field[f], edge);
         const Vector3 br = unit(Vector3::crossProduct(normals[f], b), Vector3(0, 1, 0));
+        // Spacing transports only along a feature, even when the cover cannot
+        // impose a hard axis constraint on its current field alignment.
+        if (nearestAxis)
+            return std::fabs(Vector3::dotProduct(edge, b)) > std::fabs(Vector3::dotProduct(edge, br)) ? ConstraintV : ConstraintU;
         const bool alongB = std::acos(std::max(-1.0, std::min(1.0, std::fabs(Vector3::dotProduct(edge, b))))) < 10.0 * M_PI / 180.0;
         const bool alongBr = std::acos(std::max(-1.0, std::min(1.0, std::fabs(Vector3::dotProduct(edge, br))))) < 10.0 * M_PI / 180.0;
         if (alongB == alongBr)
@@ -105,6 +112,9 @@ namespace {
         const std::vector<double>& scalingV;
         const std::vector<double>* faceScaling;
         double scale;
+        bool featureLayout;
+        const std::vector<char>& fullTurns;
+        double hardEdgeDegrees;
     };
 
     void initializeFieldAndNormals(const SurfaceMesh& mesh, const std::vector<Vector3>* guidance,
@@ -234,13 +244,13 @@ namespace {
 
     std::vector<signed char> computeCornerConstraints(const SurfaceMesh& mesh,
         const std::vector<Vector3>& field, const std::vector<Vector3>& normals, double hardEdgeDegrees,
-        const std::vector<char>* featureCorners)
+        const std::vector<char>* featureCorners, bool nearestAxis = false)
     {
         const size_t corners = mesh.cornerCount();
         std::vector<signed char> cornerConstraints(corners, ConstraintNone);
         tbb::parallel_for(tbb::blocked_range<size_t>(0, corners), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t c = range.begin(); c != range.end(); ++c)
-                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees, featureCorners));
+                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees, featureCorners, nearestAxis));
         });
         return cornerConstraints;
     }
@@ -265,6 +275,79 @@ namespace {
         { { -1, 0 }, { 0, -1 } },
         { { 0, -1 }, { 1, 0 } }
     };
+
+    void regularizeSpacing(const SurfaceMesh& mesh, const std::vector<int>& rotation,
+        const std::vector<signed char>& constraints, const std::vector<double>& faceScale,
+        const SurfaceGuidance& sizing, std::vector<double>& u, std::vector<double>& v)
+    {
+        // Remesher spacing.cpp/spacing_regularizer.cpp: final-frame stencil,
+        // then one area-weighted solve that holds tight curvature targets.
+        const size_t count = mesh.faceCount();
+        std::vector<double> lengths(2 * count), areas(count), weights(2 * count);
+        double area = 0;
+        for (size_t f = 0; f < count; ++f) {
+            lengths[2 * f] = faceScale[f] * u[f];
+            lengths[2 * f + 1] = faceScale[f] * v[f];
+            areas[f] = Vector3::crossProduct(mesh.edgeVector(3 * f), -mesh.edgeVector(3 * f + 2)).length();
+            area += areas[f];
+        }
+        if (!(area > 0) || !(sizing.spacingLower > 0) || sizing.spacingUpper < sizing.spacingLower || std::any_of(lengths.begin(), lengths.end(), [](double x) { return !std::isfinite(x) || x <= 0; }))
+            return;
+        const auto allowed = [&](size_t c, size_t k) { return constraints[c] != (k ? ConstraintV : ConstraintU); };
+        for (size_t pass = 0; pass < 11; ++pass) {
+            auto next = lengths;
+            const bool minimum = pass != 0 && pass != 3 && pass != 7 && pass != 10;
+            for (size_t f = 0; f < count; ++f)
+                for (size_t k = 0; k < 2; ++k) {
+                    double sum = lengths[2 * f + k], weight = 1;
+                    for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
+                        const size_t g = mesh.adjacentFace(c);
+                        if (g == SurfaceMesh::npos || !allowed(c, k))
+                            continue;
+                        const double x = lengths[2 * g + (k ^ (rotation[c] & 1))];
+                        if (minimum)
+                            sum = std::min(sum, x);
+                        else {
+                            sum += x;
+                            ++weight;
+                        }
+                    }
+                    next[2 * f + k] = sum / weight;
+                }
+            lengths.swap(next);
+        }
+        for (size_t f = 0; f < count; ++f) {
+            double& a = lengths[2 * f];
+            double& b = lengths[2 * f + 1];
+            a = std::min(a, b * sizing.spacingAspect);
+            b = std::min(b, a * sizing.spacingAspect);
+        }
+        ConstrainedLeastSquares system(2 * count);
+        for (size_t f = 0; f < count; ++f)
+            for (size_t k = 0; k < 2; ++k) {
+                const size_t i = 2 * f + k;
+                const double t = sizing.spacingUpper > sizing.spacingLower ? std::max(0., std::min(1., (sizing.spacingUpper - lengths[i]) / (sizing.spacingUpper - sizing.spacingLower))) : 0;
+                weights[i] = count * areas[f] / area * (sizing.faces[f].adaptiveWeight ? 10 * (1 + 100 * t) : 1);
+                system.addEnergy({ { i, 1 } }, lengths[i], weights[i]);
+            }
+        for (size_t c = 0; c < mesh.cornerCount(); ++c) {
+            const size_t o = mesh.oppositeCorner(c);
+            if (o == SurfaceMesh::npos || o < c)
+                continue;
+            for (size_t k = 0; k < 2; ++k)
+                if (allowed(c, k)) {
+                    const size_t i = 2 * mesh.cornerFace(c) + k, j = 2 * mesh.cornerFace(o) + (k ^ (rotation[c] & 1));
+                    system.addEnergy({ { i, 1 }, { j, -1 } }, 0, std::max(20., 3 * (weights[i] + weights[j])));
+                }
+        }
+        std::vector<double> solution;
+        if (!system.solve(&solution) || solution.size() != lengths.size() || std::any_of(solution.begin(), solution.end(), [](double x) { return !std::isfinite(x) || x <= 0; }))
+            return;
+        for (size_t f = 0; f < count; ++f) {
+            u[f] = solution[2 * f] / faceScale[f];
+            v[f] = solution[2 * f + 1] / faceScale[f];
+        }
+    }
 
     void applyCurlCorrection(const SurfaceMesh& mesh, const std::vector<Vector3>& normals,
         const std::vector<int>& rotation, const std::vector<signed char>& cornerConstraints,
@@ -374,7 +457,7 @@ namespace {
         }
     }
 
-    std::vector<char> computeSeam(const SurfaceMesh& mesh, const std::vector<int>& rotation)
+    std::vector<char> computeSeam(const SurfaceMesh& mesh, const std::vector<int>& rotation, const std::vector<char>& fullTurns)
     {
         const size_t corners = mesh.cornerCount();
         std::vector<char> insideBall(corners, 0), ballSeen(mesh.faceCount(), 0);
@@ -413,7 +496,7 @@ namespace {
                 if (oc == SurfaceMesh::npos || !seam[c] || rotation[c] != 0)
                     continue;
                 const size_t v0 = mesh.cornerVertex(c);
-                if (borderDegree[v0] != 1)
+                if (borderDegree[v0] != 1 || fullTurns[v0])
                     continue;
                 const size_t v1 = mesh.cornerVertex(mesh.nextCorner(c));
                 seam[c] = seam[oc] = 0;
@@ -425,6 +508,9 @@ namespace {
                 changed = true;
             }
         }
+        for (size_t c = 0; c < corners; ++c)
+            if (fullTurns[mesh.cornerVertex(c)] || fullTurns[mesh.cornerVertex(mesh.nextCorner(c))])
+                seam[c] = 1;
         return seam;
     }
 
@@ -446,6 +532,102 @@ namespace {
         }
     }
 
+    void separateFeatureRegions(const CoverContext& ctx, MixedIntegerLeastSquares& system)
+    {
+        // Remesher param/speedup_regions.cpp + speedup_policy.cpp: connect
+        // nearest feature-coordinate regions, retaining one cell across thin bands.
+        // Charts stop at seams; their integer translations remain in the cover solve.
+        const auto& mesh = ctx.mesh;
+        const size_t count = mesh.cornerCount(), none = SurfaceMesh::npos;
+        const auto value = [&](size_t i) { return double(float(system.value(i))); };
+        struct Link {
+            size_t to;
+            double primary, orthogonal, direction;
+        };
+        struct Connection {
+            size_t first, second;
+            double primary, orthogonal, direction;
+        };
+        for (size_t axis = 0; axis < 2; ++axis) {
+            std::vector<size_t> parent(count);
+            std::iota(parent.begin(), parent.end(), 0);
+            const auto root = [&](size_t x) {while (parent[x]!=x) {parent[x]=parent[parent[x]];x=parent[x];}return x; };
+            const auto join = [&](size_t a, size_t b) { parent[root(a)] = root(b); };
+            std::vector<std::vector<Link>> graph(count);
+            std::vector<char> seed(count, 0);
+            for (size_t c = 0; c < count; ++c) {
+                const size_t n = mesh.nextCorner(c), o = mesh.oppositeCorner(c), f = mesh.cornerFace(c);
+                if (o != none && !ctx.seam[c]) {
+                    const size_t other = mesh.nextCorner(o);
+                    join(c, other);
+                    graph[c].push_back({ other, 0, 0, 0 });
+                    graph[other].push_back({ c, 0, 0, 0 });
+                }
+                if (ctx.cornerConstraints[c] == (axis ? ConstraintV : ConstraintU)) {
+                    join(c, n);
+                    seed[c] = seed[n] = 1;
+                }
+                const double p = value(2 * n + axis) - value(2 * c + axis);
+                const double q = value(2 * n + 1 - axis) - value(2 * c + 1 - axis);
+                const Vector3 d = axis ? Vector3::crossProduct(ctx.normals[f], ctx.field[f]) : ctx.field[f];
+                const double direction = Vector3::dotProduct(mesh.edgeVector(c), d);
+                graph[c].push_back({ n, p, q, direction });
+                graph[n].push_back({ c, -p, -q, -direction });
+            }
+            std::vector<size_t> owner(count, none), origin(count, none);
+            std::vector<double> distance(count, 1e100), direction(count, 0);
+            using Item = std::pair<double, size_t>;
+            std::priority_queue<Item, std::vector<Item>, std::greater<Item>> queue;
+            for (size_t c = 0; c < count; ++c)
+                if (seed[c]) {
+                    owner[c] = root(c);
+                    origin[c] = c;
+                    distance[c] = 0;
+                    queue.push({ 0, c });
+                }
+            while (!queue.empty()) {
+                const auto item = queue.top();
+                queue.pop();
+                const size_t c = item.second;
+                if (item.first != distance[c])
+                    continue;
+                for (const auto& e : graph[c]) {
+                    const double d = item.first + std::hypot(e.primary, e.orthogonal);
+                    if (d < distance[e.to]) {
+                        distance[e.to] = d;
+                        owner[e.to] = owner[c];
+                        origin[e.to] = origin[c];
+                        direction[e.to] = direction[c] + e.direction;
+                        queue.push({ d, e.to });
+                    }
+                }
+            }
+            std::map<std::pair<size_t, size_t>, Connection> connections;
+            for (size_t c = 0; c < count; ++c)
+                if (owner[c] != none)
+                    for (const auto& e : graph[c])
+                        if (owner[e.to] != none && owner[c] < owner[e.to]) {
+                            const size_t a = origin[c], b = origin[e.to];
+                            const double p = value(2 * b + axis) - value(2 * a + axis);
+                            const double q = value(2 * b + 1 - axis) - value(2 * a + 1 - axis);
+                            const auto key = std::make_pair(owner[c], owner[e.to]);
+                            const auto old = connections.find(key);
+                            if (old == connections.end() || std::fabs(p) + std::fabs(q) < std::fabs(old->second.primary) + std::fabs(old->second.orthogonal))
+                                connections[key] = { a, b, p, q, direction[c] + e.direction - direction[e.to] };
+                        }
+            std::vector<Connection> ordered;
+            for (const auto& item : connections)
+                ordered.push_back(item.second);
+            std::sort(ordered.begin(), ordered.end(), [](const Connection& a, const Connection& b) { return std::fabs(a.primary) < std::fabs(b.primary); });
+            for (const auto& c : ordered)
+                if (std::fabs(c.primary) < 1.35 && std::fabs(c.orthogonal) < 2 * std::fabs(c.primary) && std::fabs(c.direction) > 1e-12)
+                    system.separateIntegerCoordinates(2 * c.first + axis, 2 * c.second + axis, c.direction > 0 ? 1 : -1);
+        }
+    }
+
+    // Seamless integer-grid parameterization background: Bommes et al., MIQ (2009).
+    // https://doi.org/10.1145/1531326.1531383
+    // Directional weights and lattice-separation rules here are implementation-specific.
     bool solveQuadCover(const CoverContext& ctx, std::vector<double>* values,
         const ProgressHandler* progressHandler)
     {
@@ -468,25 +650,49 @@ namespace {
         };
         report(0.0f, "Building cover system");
         MixedIntegerLeastSquares s(variables);
-        for (size_t t = 0; t < 2 * corners; ++t)
-            s.setVariablePeriod(uvVariables + t, 2);
-        for (size_t f = 0; f < mesh.faceCount(); ++f) {
-            const Vector3 u = field[f], v = unit(Vector3::crossProduct(normals[f], u), mesh.edgeVector(3 * f));
-            const double faceScale = faceScaling && faceScaling->size() == mesh.faceCount()
-                ? std::max(1e-12, (*faceScaling)[f])
-                : 1.0;
-            const double directionalU = std::max(1e-12, activeScalingU[f]);
-            const double directionalV = std::max(1e-12, activeScalingV[f]);
-            const double su = scale * faceScale * directionalU;
-            const double sv = scale * faceScale * directionalV;
-            for (size_t l = 0; l < 3; ++l) {
-                size_t c = 3 * f + l, n = mesh.nextCorner(c);
-                Vector3 e = mesh.edgeVector(c);
-                const double weight = su * sv;
-                s.addEnergy(2 * n, 1, 2 * c, -1, Vector3::dotProduct(u, e) / su, weight);
-                s.addEnergy(2 * n + 1, 1, 2 * c + 1, -1, Vector3::dotProduct(v, e) / sv, weight);
-            }
+        // Remesher uses unit chart offsets. Apply them to smooth open pieces;
+        // retain the established lattice where interior hard-feature rows meet.
+        bool open = false, interiorFeature = false;
+        for (size_t c = 0; c < corners; ++c) {
+            if (mesh.isBoundaryCorner(c))
+                open = true;
+            else
+                interiorFeature |= std::fabs(mesh.normalAngle(c)) * 180 / M_PI >= ctx.hardEdgeDegrees;
         }
+        for (size_t t = 0; t < 2 * corners; ++t)
+            s.setVariablePeriod(uvVariables + t, ctx.featureLayout && open && !interiorFeature ? 1 : 2);
+        std::vector<std::array<double, 4>> weights(mesh.faceCount(), { 1, 1, 1, 1 });
+        const auto energies = [&]() {
+            for (size_t f = 0; f < mesh.faceCount(); ++f) {
+                const Vector3 u = field[f], v = unit(Vector3::crossProduct(normals[f], u), mesh.edgeVector(3 * f));
+                const double faceScale = faceScaling && faceScaling->size() == mesh.faceCount()
+                    ? std::max(1e-12, (*faceScaling)[f])
+                    : 1.0;
+                const double directionalU = std::max(1e-12, activeScalingU[f]);
+                const double directionalV = std::max(1e-12, activeScalingV[f]);
+                const double su = scale * faceScale * directionalU;
+                const double sv = scale * faceScale * directionalV;
+                // Remesher param/system.cpp: area-weighted derivatives in the
+                // field frame, with 0.55 on the two nonzero-target rows.
+                const auto& t = mesh.triangle(f);
+                const double area2 = Vector3::crossProduct(mesh.position(t[1]) - mesh.position(t[0]),
+                    mesh.position(t[2]) - mesh.position(t[0]))
+                                         .length();
+                if (area2 <= 1e-30)
+                    continue;
+                for (size_t coordinate = 0; coordinate < 2; ++coordinate)
+                    for (size_t axis = 0; axis < 2; ++axis) {
+                        std::vector<std::pair<size_t, double>> row;
+                        for (size_t k = 0; k < 3; ++k) {
+                            const Vector3 opposite = mesh.position(t[(k + 2) % 3]) - mesh.position(t[(k + 1) % 3]);
+                            const Vector3 gradient = Vector3::crossProduct(normals[f], opposite) / area2;
+                            row.push_back({ 2 * (3 * f + k) + coordinate, (coordinate ? sv : su) * Vector3::dotProduct(axis ? v : u, gradient) });
+                        }
+                        s.addEnergy(row, coordinate == axis ? 1 : 0, area2 * (coordinate == axis ? .55 : 1) * weights[f][2 * coordinate + axis]);
+                    }
+            }
+        };
+        energies();
         s.addConstraint(0, 1);
         s.addConstraint(1, 1);
         size_t hardCoordinateCount = 0;
@@ -508,6 +714,10 @@ namespace {
             const size_t oc = mesh.oppositeCorner(c);
             if (oc == SurfaceMesh::npos)
                 continue;
+            // Full-turn spokes meet at an unsplit far endpoint. Remesher's
+            // singleton-chain rule leaves their pole copies independent.
+            if (ctx.fullTurns[mesh.cornerVertex(c)])
+                continue;
             const size_t other = mesh.nextCorner(oc);
             const size_t tc = uvVariables + 2 * c;
             const int r = (rotation[c] % 4 + 4) % 4;
@@ -527,7 +737,7 @@ namespace {
         }
         for (size_t vertex = 0; vertex < mesh.vertexCount(); ++vertex) {
             const auto& incident = mesh.cornersAroundVertex(vertex);
-            if (incident.empty())
+            if (incident.empty() || ctx.fullTurns[vertex])
                 continue;
             size_t start = incident.front(), c = start;
             int accumulated = 0;
@@ -589,15 +799,75 @@ namespace {
         }
         report(0.2f, "Eliminating cover constraints");
         s.finalizeConstraints();
-        // Rounding usually converges after a couple of passes, well short of the
-        // cap, so spread the fraction over the passes it is expected to take and
-        // clamp instead of pacing it against the cap and barely moving.
-        const size_t maximumIterations = 100;
+        if (ctx.featureLayout) {
+            if (!s.solveIteration(false))
+                return false;
+            // Remesher speedup_reweight.cpp: spacing/flip penalties, transported
+            // across ten adjacency passes, before discrete layout decisions.
+            for (size_t f = 0; f < mesh.faceCount(); ++f) {
+                const auto& t = mesh.triangle(f);
+                const auto n = normals[f];
+                const double area2 = Vector3::crossProduct(mesh.position(t[1]) - mesh.position(t[0]), mesh.position(t[2]) - mesh.position(t[0])).length();
+                if (area2 <= 1e-30)
+                    continue;
+                // The original reweight stage reads stored float UVs. In
+                // double precision a near-zero determinant can change sign.
+                Vector2 uv[3];
+                for (size_t k = 0; k < 3; ++k)
+                    uv[k] = { float(s.value(2 * (3 * f + k))), float(s.value(2 * (3 * f + k) + 1)) };
+                Vector3 gradient[2];
+                for (size_t k = 0; k < 3; ++k)
+                    for (size_t axis = 0; axis < 2; ++axis)
+                        gradient[axis] += Vector3::crossProduct(n, mesh.position(t[(k + 2) % 3]) - mesh.position(t[(k + 1) % 3])) * (uv[k][axis] / area2);
+                const auto a = uv[1] - uv[0], b = uv[2] - uv[0];
+                const double flip = a.x() * b.y() - a.y() * b.x() < 0 ? 5 : 0;
+                for (size_t axis = 0; axis < 2; ++axis) {
+                    const double target = scale * (faceScaling ? (*faceScaling)[f] : 1) * (axis ? activeScalingV[f] : activeScalingU[f]);
+                    const double stretch = 1 / std::max(1e-30, gradient[axis].length() * target);
+                    weights[f][3 * axis] += std::min(3., std::max(0., (stretch - 1.8) * 3 / 2.2));
+                }
+                for (double& w : weights[f])
+                    w = std::min(10., w + flip);
+            }
+            for (size_t pass = 0; pass < 10; ++pass) {
+                auto next = weights;
+                for (size_t f = 0; f < mesh.faceCount(); ++f)
+                    for (size_t axis = 0; axis < 2; ++axis) {
+                        double sum[2] = { weights[f][3 * axis], weights[f][1 + axis] }, count = 1;
+                        for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
+                            const size_t g = mesh.adjacentFace(c);
+                            if (g == SurfaceMesh::npos)
+                                continue;
+                            if (cornerConstraints[c] == (axis ? ConstraintV : ConstraintU))
+                                continue;
+                            const size_t other = axis ^ (rotation[c] & 1);
+                            sum[0] += weights[g][3 * other];
+                            sum[1] += weights[g][1 + other];
+                            ++count;
+                        }
+                        next[f][3 * axis] = sum[0] / count;
+                        next[f][1 + axis] = sum[1] / count;
+                    }
+                weights.swap(next);
+            }
+            s.clearEnergy();
+            energies();
+        }
+        if (ctx.featureLayout) {
+            if (!s.solveIteration(false))
+                return false;
+            separateFeatureRegions(ctx, s);
+            if (!s.solveIteration(false))
+                return false;
+        }
+        // A budgeted pass fixes at least one remaining integer variable. Allow
+        // that worst case, plus the initial continuous solve, for every layout.
+        const size_t maximumIterations = ctx.featureLayout ? s.integerKernelVariableCount() + 1 : 100;
         const size_t expectedIterations = 4;
         for (size_t iteration = 0; iteration < maximumIterations; ++iteration) {
             report(0.3f + 0.65f * std::min(1.0f, (float)iteration / expectedIterations),
                 "Rounding cover to integers");
-            if (!s.solveIteration())
+            if (!s.solveIteration(true, ctx.featureLayout))
                 return false;
             if (s.converged())
                 break;
@@ -650,13 +920,15 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<double>* faceScalingU,
     const std::vector<double>* faceScalingV,
     const ProgressHandler* progressHandler,
-    const std::vector<char>* featureCorners)
+    const std::vector<char>* featureCorners, bool featureLayout, const SurfaceGuidance* sizing)
 {
     const auto report = [progressHandler](float fraction, const char* name) {
         if (nullptr != progressHandler && *progressHandler)
             (*progressHandler)(fraction, name);
     };
 
+    if ((faceScaling && faceScaling->size() != triangles.size()) || (featureCorners && featureCorners->size() != 3 * triangles.size()))
+        return false;
     if (vertices.empty() || triangles.empty() || scaling <= 0.0)
         return false;
     report(0.0f, "Initializing cover field");
@@ -692,13 +964,45 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     if (trackDirectionalScale)
         applyDirectionalSwaps(mesh, fieldBeforeBrush, result->field, normals,
             &activeScalingU, &activeScalingV);
+    if (featureLayout && sizing && sizing->faces.size() == mesh.faceCount() && faceScaling && faceScaling->size() == mesh.faceCount())
+        regularizeSpacing(mesh, rotation, computeCornerConstraints(mesh, result->field, normals, hardEdgeDegrees, featureCorners, true), *faceScaling, *sizing, activeScalingU, activeScalingV);
     report(0.20f, "Correcting field curl");
-    applyCurlCorrection(mesh, normals, rotation, cornerConstraints,
-        faceScaling, scale, 1e-4, &activeScalingU, &activeScalingV, &result->field);
-    const std::vector<char> seam = computeSeam(mesh, rotation);
+
+    if (!featureLayout)
+        applyCurlCorrection(mesh, normals, rotation, cornerConstraints,
+            faceScaling, scale, 1e-4, &activeScalingU, &activeScalingV, &result->field);
+    // Turning-number/index background: Ray et al. (2008), Sections 2.5-2.6.
+    // https://doi.org/10.1145/1356682.1356683 ; the full-turn tolerance below is local.
+    // Remesher field/singularities.cpp: modulo-four charge misses radial
+    // full-turn fans. Compare transported field holonomy with the corner sum.
+    std::vector<char> fullTurns(mesh.vertexCount(), 0);
+    if (featureLayout)
+        for (size_t vertex = 0; vertex < mesh.vertexCount(); ++vertex) {
+            double holonomy = 0, geometry = 0;
+            bool boundary = false;
+            for (size_t c : mesh.cornersAroundVertex(vertex)) {
+                const size_t p = mesh.previousCorner(c), o = mesh.oppositeCorner(p), f = mesh.cornerFace(c);
+                const Vector3 a = -mesh.edgeVector(p).normalized(), b = mesh.edgeVector(c).normalized();
+                geometry += std::acos(std::max(-1., std::min(1., Vector3::dotProduct(a, b))));
+                if (o == SurfaceMesh::npos) {
+                    boundary = true;
+                    continue;
+                }
+                const size_t g = mesh.cornerFace(o);
+                const Vector3 e = mesh.edgeVector(p).normalized();
+                const auto angle = [&](size_t h) { return std::atan2(Vector3::dotProduct(result->field[h], Vector3::crossProduct(normals[h], e)), Vector3::dotProduct(result->field[h], e)); };
+                holonomy += std::remainder(angle(g) - angle(f), M_PI / 2);
+            }
+            fullTurns[vertex] = !boundary && std::fabs(holonomy - geometry) < .05;
+        }
+    result->fullTurnVertices.clear();
+    for (size_t v = 0; v < fullTurns.size(); ++v)
+        if (fullTurns[v])
+            result->fullTurnVertices.push_back(v);
+    const std::vector<char> seam = computeSeam(mesh, rotation, fullTurns);
 
     const CoverContext ctx { mesh, result->field, normals, rotation, seam, cornerConstraints,
-        activeScalingU, activeScalingV, faceScaling, scale };
+        activeScalingU, activeScalingV, faceScaling, scale, featureLayout, fullTurns, hardEdgeDegrees };
 
     // The cover solve reports on its own 0..1, so remap it into the tail of this
     // function's range and keep the fractions monotonic end to end.

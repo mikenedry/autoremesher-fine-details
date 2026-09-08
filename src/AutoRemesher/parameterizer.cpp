@@ -140,7 +140,7 @@ namespace {
 
 }
 
-bool Parameterizer::parameterize()
+bool Parameterizer::parameterize(bool featureLayout)
 {
 #if AUTO_REMESHER_DEV
     {
@@ -180,9 +180,22 @@ bool Parameterizer::parameterize()
         localAnalysis.reset(new SurfaceAnalysis(topology, topology.averageEdgeLength(),
             m_sharpEdgeDegrees, m_adaptivity, m_anisotropy));
     const SurfaceAnalysis& analysis = m_analysis ? *m_analysis : *localAnalysis;
-    const SurfaceGuidance guidance = analysis.transfer(topology);
+    SurfaceGuidance guidance;
+    if (analysis.featureLayout()) {
+        SurfaceAnalysis measured(topology, analysis.length(), m_sharpEdgeDegrees, m_adaptivity, m_anisotropy,
+            true, true, m_spacingRefinement);
+        guidance = measured.transfer(topology, true);
+        for (size_t f = 0; f < topology.faceCount(); ++f)
+            if (guidance.featureCorners[3 * f] || guidance.featureCorners[3 * f + 1] || guidance.featureCorners[3 * f + 2])
+                guidance.faces[f].confidence = 1;
+    } else
+        guidance = analysis.transfer(topology);
     // Convert physical sizes to the cover's working-edge units exactly once.
     const double relativeLength = analysis.length() / std::max(1e-12, topology.averageEdgeLength());
+    const double adaptive = std::max(0., std::min(2., m_adaptivity));
+    guidance.spacingUpper = relativeLength;
+    guidance.spacingLower = relativeLength / (adaptive <= 1 ? 1 + 3 * adaptive : 4 + 8 * (adaptive - 1));
+    guidance.spacingAspect = std::pow(2.3, std::max(0., std::min(1., m_anisotropy)));
     std::vector<double> faceScalingField(topology.faceCount());
     for (size_t f = 0; f < topology.faceCount(); ++f)
         faceScalingField[f] = guidance.faces[f].scale * (m_adaptivity > 0 ? relativeLength : std::min(1.0, relativeLength));
@@ -193,7 +206,7 @@ bool Parameterizer::parameterize()
     if (nullptr != m_triangleFieldVectors) {
         field = *m_triangleFieldVectors;
     } else if (!FrameField::create(topology, m_sharpEdgeDegrees,
-                   &field, &guidance)) {
+                   &field, &guidance, analysis.featureLayout())) {
         std::cerr << "Frame field solve failed" << std::endl;
         return false;
     }
@@ -234,11 +247,14 @@ bool Parameterizer::parameterize()
     if (!QuadParameterizer::parameterize(*m_vertices, *m_triangles,
             &field, m_scaling, m_sharpEdgeDegrees, &cover,
             &faceScalingField, &faceScalingU, &faceScalingV,
-            coverProgress ? &coverProgress : nullptr, &guidance.featureCorners)) {
+            coverProgress ? &coverProgress : nullptr, &guidance.featureCorners, featureLayout || analysis.featureLayout(),
+            m_spacingRefinement && analysis.featureLayout() && adaptive > 0 ? &guidance : nullptr)) {
         std::cerr << "Quad cover solve failed" << std::endl;
         return false;
     }
+
     report(0.99f, "Collecting singularities");
+    m_fullTurnVertices = cover.fullTurnVertices;
     m_originalTriangleUvs = cover.triangleUvs;
     m_triangleUvs = std::make_unique<std::vector<std::vector<Vector2>>>(cover.triangleUvs);
     m_singularVertexPositions.clear();

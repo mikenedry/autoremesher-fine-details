@@ -97,12 +97,15 @@ public:
         m_progressHandler = std::move(progressHandler);
     }
 
+    const std::vector<size_t>& fullTurnVertices() const { return m_fullTurnVertices; }
     void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
+    void setSpacingRefinement(bool refine) { m_spacingRefinement = refine; }
 
-    bool parameterize();
+    bool parameterize(bool featureLayout = false);
 
 private:
     const SurfaceAnalysis* m_analysis = nullptr;
+    std::vector<size_t> m_fullTurnVertices;
     const std::vector<Vector3>* m_vertices = nullptr;
     const std::vector<std::vector<size_t>>* m_triangles = nullptr;
     const std::vector<Vector3>* m_triangleFieldVectors = nullptr;
@@ -115,6 +118,7 @@ private:
     double m_sharpEdgeDegrees = 90.0;
     double m_anisotropy = 1.0;
     bool m_singularitySimplification = true;
+    bool m_spacingRefinement = false;
     size_t m_maximumSingularityPairDistance = 6;
     ProgressHandler m_progressHandler;
 };
