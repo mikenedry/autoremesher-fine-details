@@ -34,6 +34,7 @@ public:
         std::vector<Vector3>* faceField);
     void setMaximumPairDistance(size_t hops) { m_maximumPairDistance = hops; }
     void setSharpEdgeDegrees(double degrees) { m_sharpEdgeDegrees = degrees; }
+    void setFeatureCorners(const std::vector<char>* corners) { m_featureCorners = corners; }
     void simplify();
     std::vector<int> vertexCharges() const;
     size_t singularityCount() const;
@@ -43,6 +44,7 @@ public:
 
 private:
     const SurfaceMesh& m_mesh;
+    const std::vector<char>* m_featureCorners = nullptr;
     std::vector<Vector3>* m_field;
     size_t m_maximumPairDistance = 6, m_maximumRounds = 4, m_regionMargin = 6;
     double m_sharpEdgeDegrees = 90.0;

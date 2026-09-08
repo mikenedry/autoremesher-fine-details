@@ -37,6 +37,7 @@
 namespace AutoRemesher {
 
 class IsotropicRemesher;
+class SurfaceAnalysis;
 
 enum class ModelType {
     Organic,
@@ -65,6 +66,7 @@ public:
 
     struct PreparedIsland {
         std::shared_ptr<const ReferenceSurface> reference;
+        std::shared_ptr<const SurfaceAnalysis> analysis;
         // Ranges in isotropicVertices()/isotropicTriangles(), after merging.
         size_t vertexOffset = 0;
         size_t vertexCount = 0;
@@ -291,7 +293,8 @@ private:
         std::atomic<long long>* adaptiveFieldTimeUs,
         const ProgressHandler* progressHandler,
         std::vector<Vector3>* decimatedVerticesOut,
-        std::vector<std::vector<size_t>>* decimatedTrianglesOut);
+        std::vector<std::vector<size_t>>* decimatedTrianglesOut,
+        const SurfaceAnalysis* analysis);
     static double calculateMeshArea(const std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& triangles);
 };

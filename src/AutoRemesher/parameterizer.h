@@ -29,6 +29,8 @@
 
 namespace AutoRemesher {
 
+class SurfaceAnalysis;
+
 class Parameterizer {
 public:
     Parameterizer(const std::vector<Vector3>* vertices,
@@ -95,9 +97,12 @@ public:
         m_progressHandler = std::move(progressHandler);
     }
 
+    void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
+
     bool parameterize();
 
 private:
+    const SurfaceAnalysis* m_analysis = nullptr;
     const std::vector<Vector3>* m_vertices = nullptr;
     const std::vector<std::vector<size_t>>* m_triangles = nullptr;
     const std::vector<Vector3>* m_triangleFieldVectors = nullptr;
@@ -109,15 +114,9 @@ private:
     double m_adaptivity = 0.5;
     double m_sharpEdgeDegrees = 90.0;
     double m_anisotropy = 1.0;
-    double m_maxAspectRatio = 2.3;
     bool m_singularitySimplification = true;
     size_t m_maximumSingularityPairDistance = 6;
     ProgressHandler m_progressHandler;
-
-    std::vector<double> computeFaceScalingField(const std::vector<Vector3>& vertices,
-        const std::vector<std::vector<size_t>>& triangles,
-        const std::vector<Vector3>& vertexNormals,
-        const std::vector<std::vector<size_t>>& faceAroundVertexMap) const;
 };
 
 }

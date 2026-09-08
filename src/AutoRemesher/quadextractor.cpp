@@ -1,3 +1,4 @@
+#include "surfaceanalysis.h"
 /*
  *  Copyright (c) 2026 Jeremy HU <jeremy-at-dust3d dot org>. All rights reserved. 
  *
@@ -266,6 +267,10 @@ bool QuadExtractor::extract()
     splitHighValenceTriangleFans();
     report(0.99f, "Collapsing three valence edge pairs");
     collapseThreeValenceEdgePairs();
+    if (m_analysis) {
+        report(.995f, "Confining vertices to source curves");
+        m_curveVertices = m_analysis->finishCurves(m_remeshedVertices, m_remeshedPolygons);
+    }
     report(1.0f, "");
 
 #if AUTO_REMESHER_DEV

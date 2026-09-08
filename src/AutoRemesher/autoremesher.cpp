@@ -1,3 +1,4 @@
+#include "surfaceanalysis.h"
 /*
  *  Copyright (c) 2026 Jeremy HU <jeremy-at-dust3d dot org>. All rights reserved.
  *
@@ -313,7 +314,8 @@ void AutoRemesher::resample(std::vector<Vector3>& vertices,
     std::atomic<long long>* adaptiveFieldTimeUs,
     const ProgressHandler* progressHandler,
     std::vector<Vector3>* decimatedVerticesOut,
-    std::vector<std::vector<size_t>>* decimatedTrianglesOut)
+    std::vector<std::vector<size_t>>* decimatedTrianglesOut,
+    const SurfaceAnalysis* analysis)
 {
     auto t_decimateStart = std::chrono::high_resolution_clock::now();
     decimateIfTooDense(vertices, triangles, voxelSize, sharpEdgeDegrees, islandIndex, decimationStats);
@@ -330,125 +332,11 @@ void AutoRemesher::resample(std::vector<Vector3>& vertices,
 
     auto t_fieldStart = std::chrono::high_resolution_clock::now();
     std::vector<double> vertexTargetLengths;
-    if (adaptivity > 0.0 && !vertices.empty()) {
-        // A target-length field redistributes the uniform triangle budget.  The
-        // field is deliberately computed on the input mesh: IsotropicRemesher
-        // propagates it to vertices created by edge splits.
-        const double minRatio = 0.35;
-        const double maxRatio = 3.0;
-        const double epsilon = 1e-12;
-
-        // Do not add face normals directly from parallel workers: adjacent
-        // faces write to the same vertex.  Compute faces in parallel, then do
-        // the small accumulation pass serially.
-        std::vector<Vector3> faceNormals(triangles.size());
-        std::vector<double> faceAreas(triangles.size(), 0.0);
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, triangles.size()),
-            [&](const tbb::blocked_range<size_t>& range) {
-                for (size_t i = range.begin(); i != range.end(); ++i) {
-                    const auto& tri = triangles[i];
-                    faceAreas[i] = Vector3::area(
-                        vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]);
-                    if (faceAreas[i] > epsilon)
-                        faceNormals[i] = Vector3::normal(
-                            vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]);
-                }
-            });
-
-        std::vector<Vector3> normals(vertices.size());
-        std::vector<std::vector<size_t>> neighbors(vertices.size());
-        for (size_t i = 0; i < triangles.size(); ++i) {
-            const auto& tri = triangles[i];
-            if (faceAreas[i] <= epsilon)
-                continue;
-            const Vector3 weightedNormal = faceNormals[i] * faceAreas[i];
-            for (size_t j = 0; j < 3; ++j) {
-                normals[tri[j]] += weightedNormal;
-                neighbors[tri[j]].push_back(tri[(j + 1) % 3]);
-                neighbors[tri[j]].push_back(tri[(j + 2) % 3]);
-            }
-        }
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, normals.size()),
-            [&](const tbb::blocked_range<size_t>& range) {
-                for (size_t i = range.begin(); i != range.end(); ++i) {
-                    normals[i].normalize();
-                    auto& ring = neighbors[i];
-                    std::sort(ring.begin(), ring.end());
-                    ring.erase(std::unique(ring.begin(), ring.end()), ring.end());
-                }
-            });
-
-        // Mean normal variation per unit length is less sensitive to a single
-        // bad triangle than the previous maximum-one-ring estimate.
-        std::vector<double> vertexCurvature(vertices.size(), 0.0);
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, vertices.size()),
-            [&](const tbb::blocked_range<size_t>& range) {
-                for (size_t v = range.begin(); v != range.end(); ++v) {
-                    const auto& ring = neighbors[v];
-                    if (ring.empty() || normals[v].lengthSquared() <= epsilon)
-                        continue;
-                    double weightedCurvature = 0.0;
-                    double totalWeight = 0.0;
-                    for (const auto& u : ring) {
-                        const double length = (vertices[u] - vertices[v]).length();
-                        if (length <= epsilon || normals[u].lengthSquared() <= epsilon)
-                            continue;
-                        double cosine = Vector3::dotProduct(normals[v], normals[u]);
-                        cosine = std::max(-1.0, std::min(1.0, cosine));
-                        weightedCurvature += std::acos(cosine);
-                        totalWeight += length;
-                    }
-                    if (totalWeight > epsilon)
-                        vertexCurvature[v] = weightedCurvature / totalWeight;
-                }
-            });
-
-        // A percentile reference prevents a few very sharp/noisy vertices from
-        // making the rest of the surface appear flat.
-        std::vector<double> nonZeroCurvatures;
-        nonZeroCurvatures.reserve(vertexCurvature.size());
-        for (double curvature : vertexCurvature) {
-            if (curvature > epsilon)
-                nonZeroCurvatures.push_back(curvature);
-        }
-        if (!nonZeroCurvatures.empty()) {
-            const size_t referenceIndex = (nonZeroCurvatures.size() - 1) * 3 / 4;
-            std::nth_element(nonZeroCurvatures.begin(),
-                nonZeroCurvatures.begin() + referenceIndex, nonZeroCurvatures.end());
-            const double curvatureReference = nonZeroCurvatures[referenceIndex];
-            vertexTargetLengths.resize(vertices.size());
-            std::vector<double> importance(vertices.size(), 1.0);
-            const double strength = std::min(adaptivity, 2.0) * 7.0;
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, vertices.size()),
-                [&](const tbb::blocked_range<size_t>& range) {
-                    for (size_t v = range.begin(); v != range.end(); ++v) {
-                        const double normalized = std::min(4.0,
-                            vertexCurvature[v] / std::max(curvatureReference, epsilon));
-                        importance[v] += strength * normalized * normalized;
-                    }
-                });
-
-            // Keep integral(area / h^2) equal to the uniform field, which
-            // preserves the budget implied by voxelSize while moving triangles
-            // from flat regions to detailed ones.
-            double totalArea = 0.0;
-            double weightedImportance = 0.0;
-            for (size_t i = 0; i < triangles.size(); ++i) {
-                const auto& tri = triangles[i];
-                totalArea += faceAreas[i];
-                weightedImportance += faceAreas[i] * (importance[tri[0]] + importance[tri[1]] + importance[tri[2]]) / 3.0;
-            }
-            if (totalArea > epsilon) {
-                const double averageImportance = weightedImportance / totalArea;
-                for (size_t v = 0; v < vertices.size(); ++v) {
-                    double multiplier = std::sqrt(averageImportance / importance[v]);
-                    multiplier = std::max(minRatio, std::min(maxRatio, multiplier));
-                    vertexTargetLengths[v] = voxelSize * multiplier;
-                }
-            } else {
-                vertexTargetLengths.clear();
-            }
-        }
+    if (adaptivity > 0.0 && analysis) {
+        vertexTargetLengths.resize(vertices.size());
+        tbb::parallel_for(size_t(0), vertices.size(), [&](size_t v) {
+            vertexTargetLengths[v] = analysis->scalarSize(vertices[v]);
+        });
     }
     if (nullptr != adaptiveFieldTimeUs) {
         *adaptiveFieldTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -611,6 +499,7 @@ bool AutoRemesher::remesh()
 #endif
 
     struct IslandContext {
+        std::shared_ptr<const SurfaceAnalysis> analysis;
         std::vector<Vector3> vertices;
         std::vector<std::vector<size_t>> triangles;
         double voxelSize;
@@ -666,7 +555,10 @@ bool AutoRemesher::remesh()
                 // No mutable owner remains once this snapshot is published.
                 m_preparedIslands[islandIndex].reference = std::make_shared<const ReferenceSurface>(std::move(reference));
 
-                context.scaling = m_scaling;
+                context.analysis.reset(new SurfaceAnalysis(sourceMesh, m_voxelSize,
+                    m_sharpEdgeDegrees, m_adaptivity, m_anisotropy));
+                m_preparedIslands[islandIndex].analysis = context.analysis;
+                context.scaling = m_scaling > 0 ? m_scaling : 1.0;
                 context.voxelSize = m_voxelSize;
                 context.adaptivity = m_adaptivity;
                 context.anisotropy = m_anisotropy;
@@ -726,7 +618,7 @@ bool AutoRemesher::remesh()
                     auto t0 = std::chrono::high_resolution_clock::now();
                     resample(ctx.vertices, ctx.triangles, ctx.voxelSize, ctx.adaptivity, ctx.sharpEdgeDegrees, ctx.smoothNormalDegrees, i, m_decimationStats,
                         m_adaptiveFieldTime, &isotropicProgress,
-                        &(*m_decimatedIslandVertices)[i], &(*m_decimatedIslandTriangles)[i]);
+                        &(*m_decimatedIslandVertices)[i], &(*m_decimatedIslandTriangles)[i], ctx.analysis.get());
                     auto t1 = std::chrono::high_resolution_clock::now();
                     *m_resampleTime += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
@@ -840,78 +732,83 @@ bool AutoRemesher::remesh()
             for (size_t i = range.begin(); i != range.end(); ++i) {
                 auto& thread = (*m_parameterizationThreads)[i];
 
-                auto t0 = std::chrono::high_resolution_clock::now();
+                const auto run = [&](double scaling) {
+                    auto t0 = std::chrono::high_resolution_clock::now();
 
-                const auto& vertices = thread.island->vertices;
-                const auto& triangles = thread.island->triangles;
+                    const auto& vertices = thread.island->vertices;
+                    const auto& triangles = thread.island->triangles;
 
-                if (vertices.empty() || triangles.empty()) {
-                    // Still retire the island, otherwise its share of the bar
-                    // is never filled in and the total stalls short of the end.
-                    thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
-                    continue;
-                }
-
-                thread.autoRemesher->updateProgress(thread.islandIndex, islandResampleEnd);
-                thread.parameterizer = std::make_unique<Parameterizer>(&vertices,
-                    &triangles,
-                    nullptr);
-                thread.parameterizer->setProgressHandler(
-                    thread.autoRemesher->makeStageProgress(thread.islandIndex,
-                        islandResampleEnd, islandParameterizeEnd, 0.0f));
-                if (thread.island->scaling > 0.0)
-                    thread.parameterizer->setScaling(thread.island->scaling);
-                thread.parameterizer->setGradientAdaptivity(thread.island->adaptivity);
-                thread.parameterizer->setAnisotropy(thread.island->anisotropy);
-                thread.parameterizer->setSharpEdgeDegrees(thread.island->sharpEdgeDegrees);
-                bool parameterizeSucceeded = true;
-                try {
-                    parameterizeSucceeded = thread.parameterizer->parameterize();
-                } catch (const std::exception& e) {
-                    // A pathological island must not abort the whole remesh,
-                    // so log the parameterizer failure and skip its quads.
-                    parameterizeSucceeded = false;
-                    std::cerr << "Island " << (thread.islandIndex + 1)
-                              << ": parameterization failed (" << e.what()
-                              << "), skipping this island." << std::endl;
-                } catch (...) {
-                    parameterizeSucceeded = false;
-                    std::cerr << "Island " << (thread.islandIndex + 1)
-                              << ": parameterization failed (unknown error), skipping this island." << std::endl;
-                }
-
-                auto t1 = std::chrono::high_resolution_clock::now();
-                *m_parameterizeTime += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-
-                if (parameterizeSucceeded) {
-                    thread.autoRemesher->updateProgress(thread.islandIndex, islandParameterizeEnd);
-                    std::unique_ptr<std::vector<std::vector<Vector2>>> uvs = thread.parameterizer->takeTriangleUvs();
-                    if (uvs) {
-                        // Save a copy of UVs for the [param] preview overlay
-                        thread.capturedUvs = *uvs;
-                        thread.capturedOriginalUvs = thread.parameterizer->originalTriangleUvs();
+                    if (vertices.empty() || triangles.empty()) {
+                        // Still retire the island, otherwise its share of the bar
+                        // is never filled in and the total stalls short of the end.
+                        thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
+                        return;
                     }
-                    // Capture singular vertex positions for the [param] preview
-                    thread.capturedSingularVertices = thread.parameterizer->singularVertexPositions();
-                    thread.capturedSingularVertexIndices = thread.parameterizer->singularVertexIndices();
-                    thread.remesher = std::make_unique<QuadExtractor>(&vertices,
+
+                    thread.autoRemesher->updateProgress(thread.islandIndex, islandResampleEnd);
+                    thread.parameterizer = std::make_unique<Parameterizer>(&vertices,
                         &triangles,
-                        uvs.get());
-                    thread.remesher->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
-                    thread.remesher->setSingularVertices(&thread.capturedSingularVertexIndices);
-                    thread.remesher->setProgressHandler(
+                        nullptr);
+                    thread.parameterizer->setProgressHandler(
                         thread.autoRemesher->makeStageProgress(thread.islandIndex,
-                            islandParameterizeEnd, 1.0f, 1.0f));
-                    if (!thread.remesher->extract()) {
-                        thread.remesher.reset();
-                    } else {
-                        thread.capturedExtractedConnections = thread.remesher->extractedConnections();
-                        thread.capturedExtractedConnectionMoved = thread.remesher->extractedConnectionMoved();
+                            islandResampleEnd, islandParameterizeEnd, 0.0f));
+                    if (scaling > 0.0)
+                        thread.parameterizer->setScaling(scaling);
+                    thread.parameterizer->setSurfaceAnalysis(thread.island->analysis.get());
+                    thread.parameterizer->setGradientAdaptivity(thread.island->adaptivity);
+                    thread.parameterizer->setAnisotropy(thread.island->anisotropy);
+                    thread.parameterizer->setSharpEdgeDegrees(thread.island->sharpEdgeDegrees);
+                    bool parameterizeSucceeded = true;
+                    try {
+                        parameterizeSucceeded = thread.parameterizer->parameterize();
+                    } catch (const std::exception& e) {
+                        // A pathological island must not abort the whole remesh,
+                        // so log the parameterizer failure and skip its quads.
+                        parameterizeSucceeded = false;
+                        std::cerr << "Island " << (thread.islandIndex + 1)
+                                  << ": parameterization failed (" << e.what()
+                                  << "), skipping this island." << std::endl;
+                    } catch (...) {
+                        parameterizeSucceeded = false;
+                        std::cerr << "Island " << (thread.islandIndex + 1)
+                                  << ": parameterization failed (unknown error), skipping this island." << std::endl;
                     }
-                }
-                thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
-                auto t2 = std::chrono::high_resolution_clock::now();
-                *m_extractTime += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    *m_parameterizeTime += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+                    if (parameterizeSucceeded) {
+                        thread.autoRemesher->updateProgress(thread.islandIndex, islandParameterizeEnd);
+                        std::unique_ptr<std::vector<std::vector<Vector2>>> uvs = thread.parameterizer->takeTriangleUvs();
+                        if (uvs) {
+                            // Save a copy of UVs for the [param] preview overlay
+                            thread.capturedUvs = *uvs;
+                            thread.capturedOriginalUvs = thread.parameterizer->originalTriangleUvs();
+                        }
+                        // Capture singular vertex positions for the [param] preview
+                        thread.capturedSingularVertices = thread.parameterizer->singularVertexPositions();
+                        thread.capturedSingularVertexIndices = thread.parameterizer->singularVertexIndices();
+                        thread.remesher = std::make_unique<QuadExtractor>(&vertices,
+                            &triangles,
+                            uvs.get());
+                        thread.remesher->setSurfaceAnalysis(thread.island->analysis.get());
+                        thread.remesher->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
+                        thread.remesher->setSingularVertices(&thread.capturedSingularVertexIndices);
+                        thread.remesher->setProgressHandler(
+                            thread.autoRemesher->makeStageProgress(thread.islandIndex,
+                                islandParameterizeEnd, 1.0f, 1.0f));
+                        if (!thread.remesher->extract()) {
+                            thread.remesher.reset();
+                        } else {
+                            thread.capturedExtractedConnections = thread.remesher->extractedConnections();
+                            thread.capturedExtractedConnectionMoved = thread.remesher->extractedConnectionMoved();
+                        }
+                    }
+                    thread.autoRemesher->updateProgress(thread.islandIndex, 1.0f);
+                    auto t2 = std::chrono::high_resolution_clock::now();
+                    *m_extractTime += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+                };
+                run(thread.island->scaling);
             }
         }
 
@@ -969,10 +866,12 @@ bool AutoRemesher::remesh()
             thread.capturedExtractedConnectionMoved.end());
         m_isotropicExtractedConnectionMoved.resize(m_isotropicExtractedConnections.size(), 0);
     }
+    size_t curveVertices = 0;
     for (size_t i = 0; i < parameterizationThreads.size(); ++i) {
         auto& thread = parameterizationThreads[i];
         if (nullptr == thread.remesher)
             continue;
+        curveVertices += thread.remesher->constrainedCurveVertices();
         const auto& quads = thread.remesher->remeshedQuads();
         if (quads.empty())
             continue;
@@ -991,6 +890,7 @@ bool AutoRemesher::remesh()
         }
     }
 
+    std::cerr << "Source curve constrained vertices: " << curveVertices << '\n';
     auto t_mergeEnd = std::chrono::high_resolution_clock::now();
 
     const auto elapsedUs = [](const std::chrono::high_resolution_clock::time_point& from,
