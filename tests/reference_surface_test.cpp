@@ -57,6 +57,52 @@ static std::map<std::pair<size_t, size_t>, size_t> edgeUses(const Faces& faces)
     return uses;
 }
 
+static void protectedPreparationRims()
+{
+    // A subdivided 90-degree rim must survive classification, flips and relaxation.
+    for (double scale : { 1., .01 }) {
+        const size_t sides = 32;
+        std::vector<::Vector3> points;
+        Faces triangles;
+        for (double y : { -1., 1. })
+            for (size_t i = 0; i < sides; ++i)
+                points.emplace_back(scale * std::cos(2 * M_PI * i / sides), scale * y,
+                    scale * std::sin(2 * M_PI * i / sides));
+        for (size_t i = 0; i < sides; ++i) {
+            const size_t j = (i + 1) % sides;
+            triangles.push_back({ i, i + sides, j + sides });
+            triangles.push_back({ i, j + sides, j });
+        }
+        for (size_t i = 1; i + 1 < sides; ++i) {
+            triangles.push_back({ 0, i, i + 1 });
+            triangles.push_back({ sides, sides + i + 1, sides + i });
+        }
+        ::IsotropicRemesher remesher(&points, &triangles);
+        remesher.setTargetEdgeLength(.1 * scale);
+        remesher.setSharpEdgeIncludedAngle(90);
+        remesher.remesh(3);
+        auto* mesh = remesher.remeshedHalfedgeMesh();
+        for (auto* v = mesh->moveToNextVertex(nullptr); v; v = mesh->moveToNextVertex(v))
+            require(!v->position.containsNan() && !v->position.containsInf(), "nonfinite prepared rim");
+        // Every original rim segment must still be covered by working edges.
+        for (size_t i = 0; i < points.size(); ++i) {
+            const auto a = points[i], edge = points[i / sides * sides + (i + 1) % sides] - a;
+            const auto onSegment = [&](const ::Vector3& p) {
+                const double t = ::Vector3::dotProduct(p - a, edge) / edge.lengthSquared();
+                return t >= -1e-9 && t <= 1 + 1e-9 && (p - a - edge * t).length() < 1e-9 * scale;
+            };
+            double covered = 0;
+            for (auto* f = mesh->moveToNextFace(nullptr); f; f = mesh->moveToNextFace(f)) {
+                auto* h = f->halfedge;
+                for (size_t k = 0; k < 3; ++k, h = h->nextHalfedge)
+                    if (onSegment(h->startVertex->position) && onSegment(h->nextHalfedge->startVertex->position))
+                        covered += .5 * (h->startVertex->position - h->nextHalfedge->startVertex->position).length();
+            }
+            require(std::fabs(covered - edge.length()) < 1e-7 * scale, "preparation erased part of a sharp rim");
+        }
+    }
+}
+
 static void balancedRefinement()
 {
     // A folded strip with alternating diagonals has avoidable 4/8-valence
@@ -705,6 +751,7 @@ int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
+            protectedPreparationRims();
             boundedRefinement();
             balancedRefinement();
             fixtures();
