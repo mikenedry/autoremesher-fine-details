@@ -47,6 +47,7 @@ public:
     const std::vector<SurfaceGuidance::Face>& faces() const { return m_faces; }
     double length() const { return m_length; }
     bool featureLayout() const { return m_featureLayout; }
+    bool supportsRimConstraints() const { return m_preserveRim; }
     bool onSourceBoundary(const Vector3& position) const;
     bool onSourceBoundary(const Vector3& first, const Vector3& second) const;
     double surfaceDistanceSquared(const Vector3& position, Vector3* normal = nullptr) const;
@@ -68,6 +69,8 @@ private:
     std::vector<size_t> m_cornerChain;
     std::vector<SurfaceGuidance::Face> m_faces;
     bool m_featureLayout = false;
+    bool m_hasBoundary = false;
+    bool m_preserveRim = false;
     std::vector<AxisAlignedBoudingBox> m_boxes;
     std::unique_ptr<AxisAlignedBoudingBoxTree> m_tree;
     size_t nearestFace(const Vector3& p) const;

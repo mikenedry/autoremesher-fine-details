@@ -452,6 +452,56 @@ static void disconnectedFans()
         require(boundaryDegree[v.first] == 2, "fan repair capped a source boundary");
 }
 
+static void rotatedBoundaryCover()
+{
+    const std::vector<Vec3> points = { { 0, 0, 0 }, { 4, 0, 0 }, { 4, 2, 0 }, { 0, 2, 0 }, { .07, .73, 0 } };
+    const Faces triangles = { { 0, 1, 4 }, { 1, 2, 4 }, { 2, 3, 4 }, { 3, 0, 4 } };
+    const AutoRemesher::SurfaceMesh mesh(points, triangles);
+    require(!AutoRemesher::SurfaceAnalysis(mesh, .5, 90, 0, 0).supportsRimConstraints(),
+        "a shallow patch acquired hard rim constraints");
+    for (double scale : { 1., 1e-9 }) {
+        auto shell = points;
+        shell.back()[2] = -1.;
+        for (auto& p : shell)
+            p *= scale;
+        const AutoRemesher::SurfaceMesh deep(shell, triangles);
+        require(AutoRemesher::SurfaceAnalysis(deep, .5 * scale, 90, 0, 0).supportsRimConstraints(),
+            "a resolved planar rim lost its constraints");
+        require(!AutoRemesher::SurfaceAnalysis(deep, 4. * scale, 90, 0, 0).supportsRimConstraints(),
+            "a subcell opening acquired hard rim constraints");
+        shell[2][2] = scale;
+        require(!AutoRemesher::SurfaceAnalysis(AutoRemesher::SurfaceMesh(shell, triangles), .5 * scale, 90, 0, 0).supportsRimConstraints(),
+            "a spatial rim acquired planar constraints");
+    }
+    // Authored boundaries remain integer isolines even when the field misses their tangent.
+    for (double angle : { M_PI / 9, M_PI / 4 }) {
+        const std::vector<Vec3> field(triangles.size(), Vec3(std::cos(angle), std::sin(angle), 0));
+        for (bool featureLayout : { false, true })
+            for (bool preserveBoundary : { false, true }) {
+                AutoRemesher::QuadParameterizer::Result result;
+                require(AutoRemesher::QuadParameterizer::parameterize(points, triangles, &field,
+                            .5 / mesh.averageEdgeLength(), 90, &result, nullptr, nullptr, nullptr, nullptr, nullptr, featureLayout, nullptr, preserveBoundary),
+                    "rotated boundary cover failed");
+                double area = 0;
+                for (const auto& t : result.triangleUvs)
+                    area += std::fabs((t[1].x() - t[0].x()) * (t[2].y() - t[0].y()) - (t[1].y() - t[0].y()) * (t[2].x() - t[0].x()));
+                require(area > 1e-6, "boundary constraints collapsed the cover");
+                if (!preserveBoundary)
+                    require(std::fabs(area - 64.) < 1e-5, "unconstrained cover changed its affine area");
+                for (size_t c = 0; c < mesh.cornerCount(); ++c)
+                    if (preserveBoundary && mesh.isBoundaryCorner(c)) {
+                        const auto& a = result.triangleUvs[c / 3][c % 3];
+                        const auto& b = result.triangleUvs[c / 3][(c + 1) % 3];
+                        bool isoline = false;
+                        for (size_t axis = 0; axis < 2; ++axis)
+                            isoline |= std::fabs(a[axis] - b[axis]) < 1e-6 && std::fabs(a[axis] - std::round(a[axis])) < 1e-6
+                                && std::fabs(a[1 - axis] - b[1 - axis]) > 1e-6;
+                        require(isoline, "authored boundary missed a noncollapsed integer isoline");
+                    }
+            }
+    }
+}
+
 static void directionalQuadCover()
 {
     // A very uneven triangulation must reproduce an affine rectangular grid,
@@ -760,6 +810,7 @@ int main(int argc, char** argv)
             telescopingTube();
             disconnectedFans();
             directionalQuadCover();
+            rotatedBoundaryCover();
             oddTubePeriod();
             featureIntegerLattice();
             tubeOpenings();
