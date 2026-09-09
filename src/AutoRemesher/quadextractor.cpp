@@ -4737,7 +4737,7 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
             (*progressHandler)(std::min(0.99f, (float)mergeCount / mergeCeiling),
                 "Merging shared five edge faces");
         }
-        // A rejected merge leaves adjacency and boundary membership unchanged.
+        // Build once; accepted merges update only changed face incidences below.
         if (rebuild) {
             edgeFaces.clear();
             vertexNeighbors.clear();
@@ -4807,6 +4807,7 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
             * 0.5;
         std::vector<std::vector<size_t>> rewritten;
         std::vector<bool> affected;
+        std::vector<size_t> changedFaces;
         rewritten.reserve(m_remeshedPolygons.size());
         affected.reserve(m_remeshedPolygons.size());
         bool valid = true;
@@ -4846,6 +4847,8 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
                     break;
                 }
             }
+            if (candidate != face)
+                changedFaces.push_back(rewritten.size());
             rewritten.push_back(std::move(candidate));
             affected.push_back(faceAffected);
         }
@@ -4880,10 +4883,52 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
         if (!m_poleOwners.empty())
             m_poleOwners[keep] = commonPoleOwner({ keep, remove });
         m_remeshedVertices[keep] = keepPosition;
+        // Only index changes affect incidence; moved coordinates leave it intact.
+        // Remove old face occurrences, then insert new occurrences in face order.
+        std::unordered_set<size_t> dirtyVertices;
+        const auto updateFaceEdges = [&](const std::vector<size_t>& face, size_t index, bool insert) {
+            for (size_t i = 0; i < face.size(); ++i) {
+                const Edge edge = edgeOf(face[i], face[(i + 1) % face.size()]);
+                dirtyVertices.insert(edge.first);
+                dirtyVertices.insert(edge.second);
+                if (insert) {
+                    auto& uses = edgeFaces[edge];
+                    uses.insert(std::lower_bound(uses.begin(), uses.end(), index), index);
+                    vertexNeighbors[edge.first].insert(edge.second);
+                    vertexNeighbors[edge.second].insert(edge.first);
+                } else {
+                    auto found = edgeFaces.find(edge);
+                    auto& uses = found->second;
+                    uses.erase(std::lower_bound(uses.begin(), uses.end(), index));
+                    if (uses.empty()) {
+                        edgeFaces.erase(found);
+                        vertexNeighbors[edge.first].erase(edge.second);
+                        vertexNeighbors[edge.second].erase(edge.first);
+                    }
+                }
+            }
+        };
+        for (size_t index : changedFaces)
+            updateFaceEdges(m_remeshedPolygons[index], index, false);
+        for (size_t index : changedFaces)
+            updateFaceEdges(rewritten[index], index, true);
+        for (size_t vertex : dirtyVertices) {
+            boundaryVertices[vertex] = false;
+            auto neighbors = vertexNeighbors.find(vertex);
+            if (neighbors->second.empty()) {
+                vertexNeighbors.erase(neighbors);
+                continue;
+            }
+            if (m_analysis && m_analysis->supportsRimConstraints())
+                for (size_t neighbor : neighbors->second)
+                    if (edgeFaces.at(edgeOf(vertex, neighbor)).size() == 1) {
+                        boundaryVertices[vertex] = true;
+                        break;
+                    }
+        }
         m_remeshedPolygons = std::move(rewritten);
         mergedVertices.insert(keep);
         ++mergeCount;
-        rebuild = true;
     }
 
     if (0 == mergeCount)

@@ -301,27 +301,29 @@ namespace {
         if (!(area > 0) || !(sizing.spacingLower > 0) || sizing.spacingUpper < sizing.spacingLower || std::any_of(lengths.begin(), lengths.end(), [](double x) { return !std::isfinite(x) || x <= 0; }))
             return;
         const auto allowed = [&](size_t c, size_t k) { return constraints[c] != (k ? ConstraintV : ConstraintU); };
-        for (size_t pass = 0; pass < 11; ++pass) {
-            auto next = lengths;
-            const bool minimum = pass != 0 && pass != 3 && pass != 7 && pass != 10;
-            for (size_t f = 0; f < count; ++f)
-                for (size_t k = 0; k < 2; ++k) {
-                    double sum = lengths[2 * f + k], weight = 1;
-                    for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
-                        const size_t g = mesh.adjacentFace(c);
-                        if (g == SurfaceMesh::npos || !allowed(c, k))
-                            continue;
-                        const double x = lengths[2 * g + (k ^ (rotation[c] & 1))];
-                        if (minimum)
-                            sum = std::min(sum, x);
-                        else {
-                            sum += x;
-                            ++weight;
+        {
+            std::vector<double> next(lengths.size());
+            for (size_t pass = 0; pass < 11; ++pass) {
+                const bool minimum = pass != 0 && pass != 3 && pass != 7 && pass != 10;
+                for (size_t f = 0; f < count; ++f)
+                    for (size_t k = 0; k < 2; ++k) {
+                        double sum = lengths[2 * f + k], weight = 1;
+                        for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
+                            const size_t g = mesh.adjacentFace(c);
+                            if (g == SurfaceMesh::npos || !allowed(c, k))
+                                continue;
+                            const double x = lengths[2 * g + (k ^ (rotation[c] & 1))];
+                            if (minimum)
+                                sum = std::min(sum, x);
+                            else {
+                                sum += x;
+                                ++weight;
+                            }
                         }
+                        next[2 * f + k] = sum / weight;
                     }
-                    next[2 * f + k] = sum / weight;
-                }
-            lengths.swap(next);
+                lengths.swap(next);
+            }
         }
         for (size_t f = 0; f < count; ++f) {
             double& a = lengths[2 * f];
@@ -836,26 +838,28 @@ namespace {
                 for (double& w : weights[f])
                     w = std::min(10., w + flip);
             }
-            for (size_t pass = 0; pass < 10; ++pass) {
-                auto next = weights;
-                for (size_t f = 0; f < mesh.faceCount(); ++f)
-                    for (size_t axis = 0; axis < 2; ++axis) {
-                        double sum[2] = { weights[f][3 * axis], weights[f][1 + axis] }, count = 1;
-                        for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
-                            const size_t g = mesh.adjacentFace(c);
-                            if (g == SurfaceMesh::npos)
-                                continue;
-                            if (cornerConstraints[c] == (axis ? ConstraintV : ConstraintU))
-                                continue;
-                            const size_t other = axis ^ (rotation[c] & 1);
-                            sum[0] += weights[g][3 * other];
-                            sum[1] += weights[g][1 + other];
-                            ++count;
+            {
+                std::vector<std::array<double, 4>> next(weights.size());
+                for (size_t pass = 0; pass < 10; ++pass) {
+                    for (size_t f = 0; f < mesh.faceCount(); ++f)
+                        for (size_t axis = 0; axis < 2; ++axis) {
+                            double sum[2] = { weights[f][3 * axis], weights[f][1 + axis] }, count = 1;
+                            for (size_t c = 3 * f; c < 3 * f + 3; ++c) {
+                                const size_t g = mesh.adjacentFace(c);
+                                if (g == SurfaceMesh::npos)
+                                    continue;
+                                if (cornerConstraints[c] == (axis ? ConstraintV : ConstraintU))
+                                    continue;
+                                const size_t other = axis ^ (rotation[c] & 1);
+                                sum[0] += weights[g][3 * other];
+                                sum[1] += weights[g][1 + other];
+                                ++count;
+                            }
+                            next[f][3 * axis] = sum[0] / count;
+                            next[f][1 + axis] = sum[1] / count;
                         }
-                        next[f][3 * axis] = sum[0] / count;
-                        next[f][1 + axis] = sum[1] / count;
-                    }
-                weights.swap(next);
+                    weights.swap(next);
+                }
             }
             s.clearEnergy();
             energies();

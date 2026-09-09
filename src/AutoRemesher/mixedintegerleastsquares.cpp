@@ -583,7 +583,9 @@ bool MixedIntegerLeastSquares::solveIteration(bool round, bool budgeted)
                 pending.push(i);
             }
         };
-        for (Row energy : m_reducedEnergy) {
+        Row energy;
+        for (const Row& sourceEnergy : m_reducedEnergy) {
+            energy = sourceEnergy;
             if (!m_separations.empty()) {
                 // Visit only reachable pivots, in the original substitution order.
                 // Scratch coefficients avoid moving a sorted row on every insertion.
