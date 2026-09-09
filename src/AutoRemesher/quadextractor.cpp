@@ -48,6 +48,44 @@
 
 namespace AutoRemesher {
 
+namespace {
+    bool hasRepeatedVertex(const std::vector<size_t>& face)
+    {
+        // Most cleanup faces are small; avoid allocating a hash table for them.
+        if (face.size() <= 8) {
+            for (size_t i = 0; i < face.size(); ++i)
+                for (size_t j = 0; j < i; ++j)
+                    if (face[i] == face[j])
+                        return true;
+            return false;
+        }
+        const std::unordered_set<size_t> vertices(face.begin(), face.end());
+        return vertices.size() != face.size();
+    }
+
+    std::vector<size_t> canonicalFace(const std::vector<size_t>& face)
+    {
+        if (face.empty())
+            return {};
+        const size_t smallest = *std::min_element(face.begin(), face.end());
+        std::vector<size_t> best;
+        // A lexicographically minimal rotation must start at the smallest index.
+        // Retain both windings and all tied starts, including malformed polygons.
+        for (bool reverse : { false, true })
+            for (size_t start = 0; start < face.size(); ++start) {
+                if (face[start] != smallest)
+                    continue;
+                std::vector<size_t> candidate;
+                candidate.reserve(face.size());
+                for (size_t i = 0; i < face.size(); ++i)
+                    candidate.push_back(face[(start + (reverse ? face.size() - i : i)) % face.size()]);
+                if (best.empty() || candidate < best)
+                    best = std::move(candidate);
+            }
+        return best;
+    }
+}
+
 bool QuadExtractor::extract(bool rejectUnsupportedCaps, bool closeResidualHoles)
 {
     m_rejectUnsupportedCaps = rejectUnsupportedCaps;
@@ -2101,10 +2139,6 @@ void QuadExtractor::convertTriangleAndFiveEdgeFans()
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
     const size_t noVertex = std::numeric_limits<size_t>::max();
     Vector3 addedPosition;
     size_t addedVertex = noVertex;
@@ -2362,26 +2396,6 @@ void QuadExtractor::collapseThreeValenceDiagonals()
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const size_t noVertex = std::numeric_limits<size_t>::max();
     const size_t noFace = std::numeric_limits<size_t>::max();
     Vector3 addedPosition;
@@ -2635,26 +2649,6 @@ void QuadExtractor::mergeDoubleSharedEdgeQuads()
     if (m_remeshedVertices.empty() || m_remeshedPolygons.empty())
         return;
 
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const auto indexOfVertex = [](const std::vector<size_t>& face, size_t vertex) {
         for (size_t i = 0; i < face.size(); ++i) {
             if (vertex == face[i])
@@ -2819,26 +2813,6 @@ void QuadExtractor::mergeThreeAndFiveValenceTriangles()
     using Edge = std::pair<size_t, size_t>;
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
-    };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
     };
     const size_t noVertex = std::numeric_limits<size_t>::max();
     Vector3 addedPosition;
@@ -3190,26 +3164,6 @@ void QuadExtractor::collapseThreeValenceCorners()
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const size_t noVertex = std::numeric_limits<size_t>::max();
     Vector3 addedPosition;
     size_t addedVertex = noVertex;
@@ -3449,10 +3403,6 @@ void QuadExtractor::splitHighValenceTriangleFans()
     using Edge = std::pair<size_t, size_t>;
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
-    };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
     };
     const size_t noVertex = std::numeric_limits<size_t>::max();
     Vector3 addedPosition;
@@ -3716,10 +3666,6 @@ void QuadExtractor::collapseThreeValenceEdgePairs()
     using Edge = std::pair<size_t, size_t>;
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
-    };
-    const auto hasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::unordered_set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
     };
     const auto faceNormal = [this](const std::vector<size_t>& face) {
         Vector3 normal;
@@ -4024,22 +3970,6 @@ void QuadExtractor::switchHighValenceEdges()
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const auto findDirectedEdge = [](const std::vector<size_t>& face, size_t from, size_t to) {
         for (size_t i = 0; i < face.size(); ++i) {
             if (from == face[i] && to == face[(i + 1) % face.size()])
@@ -4301,29 +4231,6 @@ void QuadExtractor::cleanupTriangles()
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto faceHasRepeatedVertex = [](const std::vector<size_t>& face) {
-        for (size_t i = 0; i < face.size(); ++i)
-            for (size_t j = 0; j < i; ++j)
-                if (face[i] == face[j])
-                    return true;
-        return false;
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const auto polygonNormal = [](const std::vector<Vector3>& positions) {
         Vector3 normal;
         for (size_t i = 1; i + 1 < positions.size(); ++i) {
@@ -4365,7 +4272,7 @@ void QuadExtractor::cleanupTriangles()
             repeatedVertices.resize(m_remeshedPolygons.size());
             for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
                 const auto& face = m_remeshedPolygons[faceIndex];
-                repeatedVertices[faceIndex] = faceHasRepeatedVertex(face);
+                repeatedVertices[faceIndex] = hasRepeatedVertex(face);
                 for (size_t i = 0; i < face.size(); ++i)
                     ++edgeOffsets[std::min(face[i], face[(i + 1) % face.size()]) + 1];
             }
@@ -4571,7 +4478,7 @@ void QuadExtractor::cleanupTriangles()
                 continue;
             }
             const size_t expectedSize = faceIndex == routeSink ? face.size() - 1 : face.size();
-            if (candidate.size() != expectedSize || faceHasRepeatedVertex(candidate)) {
+            if (candidate.size() != expectedSize || hasRepeatedVertex(candidate)) {
                 valid = false;
                 break;
             }
@@ -4798,26 +4705,6 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
     const auto edgeOf = [](size_t a, size_t b) {
         return std::make_pair(std::min(a, b), std::max(a, b));
     };
-    const auto faceHasRepeatedVertex = [](const std::vector<size_t>& face) {
-        std::set<size_t> vertices(face.begin(), face.end());
-        return vertices.size() != face.size();
-    };
-    const auto canonicalFace = [](const std::vector<size_t>& face) {
-        std::vector<size_t> best;
-        std::vector<size_t> reversed(face.rbegin(), face.rend());
-        for (const std::vector<size_t>* winding : {
-                 &face, static_cast<const std::vector<size_t>*>(&reversed) }) {
-            for (size_t start = 0; start < winding->size(); ++start) {
-                std::vector<size_t> candidate;
-                candidate.reserve(winding->size());
-                for (size_t i = 0; i < winding->size(); ++i)
-                    candidate.push_back((*winding)[(start + i) % winding->size()]);
-                if (best.empty() || candidate < best)
-                    best = std::move(candidate);
-            }
-        }
-        return best;
-    };
     const auto positionOf = [&](size_t vertex, size_t movedVertex, const Vector3& movedPosition) {
         return vertex == movedVertex ? movedPosition : m_remeshedVertices[vertex];
     };
@@ -4841,29 +4728,37 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
     std::set<Edge> rejectedEdges;
     std::unordered_set<size_t> mergedVertices;
     size_t mergeCount = 0;
+    std::map<Edge, std::vector<size_t>> edgeFaces;
+    std::unordered_map<size_t, std::unordered_set<size_t>> vertexNeighbors;
+    std::vector<bool> boundaryVertices;
+    bool rebuild = true;
     for (;;) {
         if (nullptr != progressHandler && *progressHandler) {
             (*progressHandler)(std::min(0.99f, (float)mergeCount / mergeCeiling),
                 "Merging shared five edge faces");
         }
-        std::map<Edge, std::vector<size_t>> edgeFaces;
-        std::unordered_map<size_t, std::unordered_set<size_t>> vertexNeighbors;
-        for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
-            const auto& face = m_remeshedPolygons[faceIndex];
-            for (size_t i = 0; i < face.size(); ++i) {
-                const size_t j = (i + 1) % face.size();
-                edgeFaces[edgeOf(face[i], face[j])].push_back(faceIndex);
-                vertexNeighbors[face[i]].insert(face[j]);
-                vertexNeighbors[face[j]].insert(face[i]);
+        // A rejected merge leaves adjacency and boundary membership unchanged.
+        if (rebuild) {
+            edgeFaces.clear();
+            vertexNeighbors.clear();
+            for (size_t faceIndex = 0; faceIndex < m_remeshedPolygons.size(); ++faceIndex) {
+                const auto& face = m_remeshedPolygons[faceIndex];
+                for (size_t i = 0; i < face.size(); ++i) {
+                    const size_t j = (i + 1) % face.size();
+                    edgeFaces[edgeOf(face[i], face[j])].push_back(faceIndex);
+                    vertexNeighbors[face[i]].insert(face[j]);
+                    vertexNeighbors[face[j]].insert(face[i]);
+                }
             }
-        }
 
-        std::vector<bool> boundaryVertices(m_remeshedVertices.size(), false);
-        for (const auto& edge : edgeFaces)
-            if (m_analysis && m_analysis->supportsRimConstraints() && edge.second.size() == 1) {
-                boundaryVertices[edge.first.first] = true;
-                boundaryVertices[edge.first.second] = true;
-            }
+            boundaryVertices.assign(m_remeshedVertices.size(), false);
+            for (const auto& edge : edgeFaces)
+                if (m_analysis && m_analysis->supportsRimConstraints() && edge.second.size() == 1) {
+                    boundaryVertices[edge.first.first] = true;
+                    boundaryVertices[edge.first.second] = true;
+                }
+            rebuild = false;
+        }
 
         const auto mergedValence = [&](const Edge& edge) {
             std::unordered_set<size_t> neighbors = vertexNeighbors[edge.first];
@@ -4940,7 +4835,7 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
                     valid = false;
                     break;
                 }
-                if (faceHasRepeatedVertex(candidate)) {
+                if (hasRepeatedVertex(candidate)) {
                     valid = false;
                     break;
                 }
@@ -4988,6 +4883,7 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
         m_remeshedPolygons = std::move(rewritten);
         mergedVertices.insert(keep);
         ++mergeCount;
+        rebuild = true;
     }
 
     if (0 == mergeCount)

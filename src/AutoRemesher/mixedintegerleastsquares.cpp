@@ -220,8 +220,6 @@ void MixedIntegerLeastSquares::finalizeConstraints()
     for (size_t index = 0; index < m_constraintRanges.size(); ++index)
         processConstraint(recordedConstraint(index));
     endPass(2);
-    for (size_t index = 0; index < m_constraintRanges.size(); ++index)
-        processConstraint(recordedConstraint(index));
     endPass(3);
 
     buildKernel();
