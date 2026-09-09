@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <numeric>
+#include <map>
 #include <queue>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
@@ -164,6 +165,53 @@ namespace {
         return selected;
     }
 
+    // Scope hard rim constraints to one simple opening, planar within a quarter cell.
+    // Multiple openings, spatial rims and subcell openings retain existing recovery.
+    bool canConstrainRim(const SurfaceMesh& mesh, double length)
+    {
+        std::vector<size_t> successor(mesh.vertexCount(), SurfaceMesh::npos), rim;
+        std::vector<bool> incoming(mesh.vertexCount(), false);
+        for (size_t c = 0; c < mesh.cornerCount(); ++c)
+            if (mesh.isBoundaryCorner(c)) {
+                const size_t a = mesh.cornerVertex(c), b = mesh.cornerVertex(mesh.nextCorner(c));
+                if (successor[a] != SurfaceMesh::npos || incoming[b])
+                    return false;
+                successor[a] = b;
+                incoming[b] = true;
+                rim.push_back(a);
+            }
+        if (rim.size() < 3)
+            return false;
+        size_t visited = 0, current = rim.front();
+        do {
+            current = successor[current];
+            if (current == SurfaceMesh::npos || ++visited > rim.size())
+                return false;
+        } while (current != rim.front());
+        if (visited != rim.size())
+            return false;
+        Vector3 center, normal;
+        for (size_t v : rim)
+            center += mesh.position(v);
+        center /= double(rim.size());
+        for (size_t v : rim)
+            normal += Vector3::crossProduct(mesh.position(v) - center, mesh.position(successor[v]) - center);
+        // The opening must enclose at least one cell at the reference spacing.
+        const double twiceArea = normal.length();
+        if (!(twiceArea >= 2 * length * length))
+            return false;
+        normal /= twiceArea;
+        for (size_t v : rim)
+            if (std::fabs(Vector3::dotProduct(mesh.position(v) - center, normal)) > .25 * length)
+                return false;
+        // Rim cleanup needs room for an adjacent row of cells. Shallow patches
+        // retain their existing recovery instead of constraining the whole detail.
+        for (size_t v = 0; v < mesh.vertexCount(); ++v)
+            if (std::fabs(Vector3::dotProduct(mesh.position(v) - center, normal)) >= length)
+                return true;
+        return false;
+    }
+
 }
 
 SurfaceAnalysis::SurfaceAnalysis(const SurfaceMesh& mesh, double length,
@@ -175,6 +223,7 @@ SurfaceAnalysis::SurfaceAnalysis(const SurfaceMesh& mesh, double length,
     , m_featureLayout(featureLayout)
 {
     traceFeatureChains(sharpDegrees);
+    m_preserveRim = m_hasBoundary && canConstrainRim(mesh, m_length);
     resolveFeatureJunctions();
     if (measureCurvature) {
         if (m_featureLayout)
@@ -195,11 +244,11 @@ void SurfaceAnalysis::traceFeatureChains(double sharpDegrees)
     // the user's hard-angle edges, reject short/incoherent automatic fragments.
     std::vector<std::vector<size_t>> incident(mesh.vertexCount());
     std::vector<size_t> edges;
-    bool open = false;
+    m_hasBoundary = false;
     const double hard = sharpDegrees * M_PI / 180.0, candidate = std::min(hard, M_PI / 6);
     for (size_t c = 0; c < mesh.cornerCount(); ++c) {
         const size_t o = mesh.oppositeCorner(c);
-        open |= o == none;
+        m_hasBoundary |= o == none;
         if (o != none && (o < c || std::fabs(mesh.normalAngle(c)) <= candidate))
             continue;
         edges.push_back(c);
@@ -237,7 +286,7 @@ void SurfaceAnalysis::traceFeatureChains(double sharpDegrees)
         chain.closed = v == start;
         // Compact automatic_classifier_rounds.ipp rule: shallow curved chains
         // lack the straight/strong evidence needed to force a grid axis.
-        if (m_featureLayout && open && !protectedEdge && !chain.closed && maximumDihedral < 44.5 * M_PI / 180 && maximumTurn >= 5 * M_PI / 180)
+        if (m_featureLayout && m_hasBoundary && !protectedEdge && !chain.closed && maximumDihedral < 44.5 * M_PI / 180 && maximumTurn >= 5 * M_PI / 180)
             chain.directional = false;
         const double coherence = chain.closed ? 1.0 : (mesh.position(v) - mesh.position(start)).length() / std::max(1e-30, chain.length);
         chain.strength = protectedEdge ? 1.0 : (chain.length >= 2 * m_length && coherence >= .7 ? .5 * coherence : 0.0);
@@ -858,9 +907,12 @@ size_t SurfaceAnalysis::finishCurves(std::vector<Vector3>& vertices,
     std::vector<std::vector<size_t>> incident(vertices.size());
     std::vector<std::unordered_set<size_t>> neighbors(vertices.size());
     std::vector<double> radius(vertices.size(), m_length);
+    std::map<std::pair<size_t, size_t>, size_t> edgeUses;
     for (size_t f = 0; f < faces.size(); ++f)
         for (size_t k = 0; k < faces[f].size(); ++k) {
             const size_t a = faces[f][k], b = faces[f][(k + 1) % faces[f].size()];
+            if (m_preserveRim)
+                ++edgeUses[std::minmax(a, b)];
             incident[a].push_back(f);
             neighbors[a].insert(b);
             neighbors[b].insert(a);
@@ -868,11 +920,21 @@ size_t SurfaceAnalysis::finishCurves(std::vector<Vector3>& vertices,
             radius[a] = std::min(radius[a], length);
             radius[b] = std::min(radius[b], length);
         }
+    std::vector<bool> boundary(vertices.size(), false);
+    for (const auto& edge : edgeUses)
+        if (edge.second == 1)
+            boundary[edge.first.first] = boundary[edge.first.second] = true;
     // Fix chain identity once. A slide cannot jump to another nearby feature.
     std::vector<CurveBinding> bindings(vertices.size());
     for (size_t v = 0; v < vertices.size(); ++v)
-        if (!incident[v].empty())
-            bindings[v] = bindCurve(vertices[v], .25 * radius[v]);
+        if (!incident[v].empty()) {
+            bindings[v] = bindCurve(vertices[v], .25 * radius[v], boundary[v]);
+            if (boundary[v] && bindings[v].chain == SurfaceMesh::npos) {
+                // Recover displaced boundary samples without enlarging the corner lock.
+                bindings[v] = bindCurve(vertices[v], .5 * m_length, true);
+                bindings[v].vertex = SurfaceMesh::npos;
+            }
+        }
     for (size_t pass = 0; pass <= iterations; ++pass) {
         const auto previous = vertices;
         for (size_t v = 0; v < vertices.size(); ++v) {

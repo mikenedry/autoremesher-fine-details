@@ -82,7 +82,7 @@ namespace {
         ConstraintV = 2 };
     int edgeConstraint(const SurfaceMesh& mesh, size_t c, const std::vector<Vector3>& field,
         const std::vector<Vector3>& normals, double hardEdgeDegrees,
-        const std::vector<char>* featureCorners, bool nearestAxis = false)
+        const std::vector<char>* featureCorners, bool nearestAxis = false, bool preserveBoundary = true)
     {
         if (!(featureCorners && (*featureCorners)[c]) && mesh.oppositeCorner(c) != SurfaceMesh::npos && std::fabs(mesh.normalAngle(c)) * 180.0 / M_PI < hardEdgeDegrees)
             return ConstraintNone;
@@ -92,8 +92,15 @@ namespace {
         const Vector3 br = unit(Vector3::crossProduct(normals[f], b), Vector3(0, 1, 0));
         // Spacing transports only along a feature, even when the cover cannot
         // impose a hard axis constraint on its current field alignment.
-        if (nearestAxis)
-            return std::fabs(Vector3::dotProduct(edge, b)) > std::fabs(Vector3::dotProduct(edge, br)) ? ConstraintV : ConstraintU;
+        // Authored boundaries must remain isolines despite imperfect field alignment.
+        const bool boundary = preserveBoundary && mesh.isBoundaryCorner(c);
+        if (nearestAxis || boundary) {
+            const double u = Vector3::dotProduct(edge, b), v = Vector3::dotProduct(edge, br);
+            // Diagonal tangents need a coherent choice for perpendicular edges.
+            if (boundary && std::fabs(std::fabs(u) - std::fabs(v)) <= 1e-12)
+                return u * v > 0 ? ConstraintV : ConstraintU;
+            return std::fabs(u) > std::fabs(v) ? ConstraintV : ConstraintU;
+        }
         const bool alongB = std::acos(std::max(-1.0, std::min(1.0, std::fabs(Vector3::dotProduct(edge, b))))) < 10.0 * M_PI / 180.0;
         const bool alongBr = std::acos(std::max(-1.0, std::min(1.0, std::fabs(Vector3::dotProduct(edge, br))))) < 10.0 * M_PI / 180.0;
         if (alongB == alongBr)
@@ -244,13 +251,13 @@ namespace {
 
     std::vector<signed char> computeCornerConstraints(const SurfaceMesh& mesh,
         const std::vector<Vector3>& field, const std::vector<Vector3>& normals, double hardEdgeDegrees,
-        const std::vector<char>* featureCorners, bool nearestAxis = false)
+        const std::vector<char>* featureCorners, bool nearestAxis = false, bool preserveBoundary = true)
     {
         const size_t corners = mesh.cornerCount();
         std::vector<signed char> cornerConstraints(corners, ConstraintNone);
         tbb::parallel_for(tbb::blocked_range<size_t>(0, corners), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t c = range.begin(); c != range.end(); ++c)
-                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees, featureCorners, nearestAxis));
+                cornerConstraints[c] = static_cast<signed char>(edgeConstraint(mesh, c, field, normals, hardEdgeDegrees, featureCorners, nearestAxis, preserveBoundary));
         });
         return cornerConstraints;
     }
@@ -920,7 +927,7 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<double>* faceScalingU,
     const std::vector<double>* faceScalingV,
     const ProgressHandler* progressHandler,
-    const std::vector<char>* featureCorners, bool featureLayout, const SurfaceGuidance* sizing)
+    const std::vector<char>* featureCorners, bool featureLayout, const SurfaceGuidance* sizing, bool preserveBoundary)
 {
     const auto report = [progressHandler](float fraction, const char* name) {
         if (nullptr != progressHandler && *progressHandler)
@@ -960,12 +967,12 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<int> rotation = computeCornerRotations(mesh, result->field, normals);
     result->cornerRotations = rotation;
     const std::vector<signed char> cornerConstraints = computeCornerConstraints(mesh, result->field,
-        normals, hardEdgeDegrees, featureCorners);
+        normals, hardEdgeDegrees, featureCorners, false, preserveBoundary);
     if (trackDirectionalScale)
         applyDirectionalSwaps(mesh, fieldBeforeBrush, result->field, normals,
             &activeScalingU, &activeScalingV);
     if (featureLayout && sizing && sizing->faces.size() == mesh.faceCount() && faceScaling && faceScaling->size() == mesh.faceCount())
-        regularizeSpacing(mesh, rotation, computeCornerConstraints(mesh, result->field, normals, hardEdgeDegrees, featureCorners, true), *faceScaling, *sizing, activeScalingU, activeScalingV);
+        regularizeSpacing(mesh, rotation, computeCornerConstraints(mesh, result->field, normals, hardEdgeDegrees, featureCorners, true, preserveBoundary), *faceScaling, *sizing, activeScalingU, activeScalingV);
     report(0.20f, "Correcting field curl");
 
     if (!featureLayout)

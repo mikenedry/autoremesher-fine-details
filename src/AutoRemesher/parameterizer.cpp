@@ -243,12 +243,13 @@ bool Parameterizer::parameterize(bool featureLayout)
             m_progressHandler(0.28f + (0.99f - 0.28f) * fraction, name);
         };
     }
+    // Use strict rim constraints only for the original single planar opening.
     QuadParameterizer::Result cover;
     if (!QuadParameterizer::parameterize(*m_vertices, *m_triangles,
             &field, m_scaling, m_sharpEdgeDegrees, &cover,
             &faceScalingField, &faceScalingU, &faceScalingV,
             coverProgress ? &coverProgress : nullptr, &guidance.featureCorners, featureLayout || analysis.featureLayout(),
-            m_spacingRefinement && analysis.featureLayout() && adaptive > 0 ? &guidance : nullptr)) {
+            m_spacingRefinement && analysis.featureLayout() && adaptive > 0 ? &guidance : nullptr, analysis.supportsRimConstraints())) {
         std::cerr << "Quad cover solve failed" << std::endl;
         return false;
     }

@@ -342,12 +342,28 @@ void QuadExtractor::extractEdges(const std::set<std::pair<size_t, size_t>>& conn
 void QuadExtractor::simplifyGraph(std::unordered_map<size_t, std::unordered_set<size_t>>& graph,
     const std::vector<Vector3>& points)
 {
+    // Protect one closest graph sample per source corner, including grid nodes.
+    // Protecting its whole neighborhood can block neighboring boundary cells.
+    std::map<size_t, std::pair<double, size_t>> representatives;
+    if (m_analysis && m_analysis->supportsRimConstraints())
+        for (const auto& node : graph) {
+            const auto binding = m_analysis->bindCurve(points[node.first], .1 * m_analysis->length(), true);
+            if (binding.vertex == SurfaceMesh::npos)
+                continue;
+            const auto candidate = std::make_pair((points[node.first] - m_analysis->projectCurve(binding, points[node.first])).lengthSquared(), node.first);
+            const auto found = representatives.find(binding.vertex);
+            if (found == representatives.end() || candidate < found->second)
+                representatives[binding.vertex] = candidate;
+        }
+    std::unordered_set<size_t> retained;
+    for (const auto& entry : representatives)
+        retained.insert(entry.second.second);
     for (;;) {
         std::unordered_map<size_t, std::pair<size_t, size_t>> delayPairs;
         for (auto it = graph.begin(); it != graph.end();) {
-            // Remesher extract/emit.cpp retains selected feature endpoints
-            // during auxiliary-node merges; degree two alone is insufficient.
-            if (it->second.size() != 2 || (m_analysis && m_analysis->bindCurve(points[it->first], .1 * m_analysis->length(), true).vertex != SurfaceMesh::npos)) {
+            if (it->second.size() != 2 || retained.count(it->first)
+                || (m_analysis && !m_analysis->supportsRimConstraints()
+                    && m_analysis->bindCurve(points[it->first], .1 * m_analysis->length(), true).vertex != SurfaceMesh::npos)) {
                 ++it;
                 continue;
             }
@@ -410,27 +426,27 @@ bool QuadExtractor::collapseTriangles(std::vector<Vector3>* crossPoints,
 {
     auto& graph = *edgeConnectMap;
 
-    std::set<std::tuple<size_t, size_t, size_t>> triangles;
-    for (const auto& level0It : graph) {
-        const auto& level0 = level0It.first;
-        for (const auto& level1 : level0It.second) {
-            auto findLevel2 = graph.find(level1);
-            if (findLevel2 == graph.end())
+    using Triangles = std::set<std::tuple<size_t, size_t, size_t>>;
+    const auto collectAround = [&](size_t vertex, Triangles& pending) {
+        const auto center = graph.find(vertex);
+        if (center == graph.end())
+            return;
+        for (size_t first : center->second) {
+            const auto neighbors = graph.find(first);
+            if (neighbors == graph.end())
                 continue;
-            for (const auto& level2 : findLevel2->second) {
-                if (level0 == level2)
+            for (size_t second : center->second) {
+                if (first >= second || !neighbors->second.count(second))
                     continue;
-                auto findLevel3 = graph.find(level2);
-                if (findLevel3 == graph.end())
-                    continue;
-                if (findLevel3->second.end() == findLevel3->second.find(level0))
-                    continue;
-                std::vector<size_t> sorted = { level0, level1, level2 };
-                std::sort(sorted.begin(), sorted.end());
-                triangles.insert(std::make_tuple(sorted[0], sorted[1], sorted[2]));
+                size_t corners[] = { vertex, first, second };
+                std::sort(corners, corners + 3);
+                pending.emplace(corners[0], corners[1], corners[2]);
             }
         }
-    }
+    };
+    Triangles triangles;
+    for (const auto& vertex : graph)
+        collectAround(vertex.first, triangles);
 
     if (triangles.empty())
         return false;
@@ -439,31 +455,44 @@ bool QuadExtractor::collapseTriangles(std::vector<Vector3>* crossPoints,
     // triangle into a single point instead would drag all of their neighbors onto
     // that point and leave a star of slivers behind it
     bool collapsed = false;
-    for (const auto& triangle : triangles) {
-        const size_t corners[3] = { std::get<0>(triangle), std::get<1>(triangle), std::get<2>(triangle) };
-        std::pair<size_t, size_t> shortestEdge;
-        double shortestLength = std::numeric_limits<double>::max();
-        bool stillATriangle = true;
-        for (size_t i = 0; i < 3; ++i) {
-            size_t j = (i + 1) % 3;
-            auto findCorner = graph.find(corners[i]);
-            if (findCorner == graph.end() || findCorner->second.end() == findCorner->second.find(corners[j])) {
-                stillATriangle = false;
-                break;
+    // A collapse can create new triangles. Revisit only its changed neighborhood
+    // in the next sorted round near authored boundaries. Interior regions keep
+    // their single pass, which preserves thin triangle fans. Refusals add no work.
+    while (!triangles.empty()) {
+        Triangles nextRound;
+        for (const auto& triangle : triangles) {
+            const size_t corners[3] = { std::get<0>(triangle), std::get<1>(triangle), std::get<2>(triangle) };
+            std::pair<size_t, size_t> shortestEdge;
+            double shortestLength = std::numeric_limits<double>::max();
+            bool stillATriangle = true;
+            for (size_t i = 0; i < 3; ++i) {
+                size_t j = (i + 1) % 3;
+                auto findCorner = graph.find(corners[i]);
+                if (findCorner == graph.end() || findCorner->second.end() == findCorner->second.find(corners[j])) {
+                    stillATriangle = false;
+                    break;
+                }
+                double length = ((*crossPoints)[corners[i]] - (*crossPoints)[corners[j]]).length();
+                if (length < shortestLength) {
+                    shortestLength = length;
+                    shortestEdge = { corners[i], corners[j] };
+                }
             }
-            double length = ((*crossPoints)[corners[i]] - (*crossPoints)[corners[j]]).length();
-            if (length < shortestLength) {
-                shortestLength = length;
-                shortestEdge = { corners[i], corners[j] };
+            // An earlier collapse may have already taken this one apart
+            if (!stillATriangle)
+                continue;
+            const size_t previousSize = graph.size();
+            collapseEdge(crossPoints, edgeConnectMap, shortestEdge);
+            if (graph.size() != previousSize) {
+                collapsed = true;
+                if (m_analysis && m_analysis->supportsRimConstraints()
+                    && m_analysis->onSourceBoundary((*crossPoints)[shortestEdge.second]))
+                    collectAround(shortestEdge.second, nextRound);
             }
         }
-        // An earlier collapse may have already taken this one apart
-        if (!stillATriangle)
-            continue;
-        collapseEdge(crossPoints, edgeConnectMap, shortestEdge);
-        collapsed = true;
-    }
 
+        triangles = std::move(nextRound);
+    }
     return collapsed;
 }
 
@@ -4328,6 +4357,7 @@ void QuadExtractor::cleanupTriangles()
     std::vector<size_t> rewriteTargets(m_remeshedVertices.size(), noFace);
     std::vector<const Vector3*> movedPositions(m_remeshedVertices.size(), nullptr);
     std::vector<bool> repeatedVertices;
+    std::vector<bool> boundaryVertices;
     bool rebuild = true;
     for (;;) {
         if (rebuild) {
@@ -4356,6 +4386,14 @@ void QuadExtractor::cleanupTriangles()
                 std::sort(edgeFaces.begin() + begin, edgeFaces.begin() + edgeOffsets[v]);
                 begin = edgeOffsets[v];
             }
+            boundaryVertices.assign(m_remeshedVertices.size(), false);
+            for (size_t i = 0; i < edgeFaces.size(); ++i)
+                if (m_analysis && m_analysis->supportsRimConstraints()
+                    && (i == 0 || edgeFaces[i - 1].first != edgeFaces[i].first)
+                    && (i + 1 == edgeFaces.size() || edgeFaces[i + 1].first != edgeFaces[i].first)) {
+                    boundaryVertices[edgeFaces[i].first.first] = true;
+                    boundaryVertices[edgeFaces[i].first.second] = true;
+                }
             pendingRoutes = {};
             nextRoute = 0;
             rebuild = false;
@@ -4382,6 +4420,9 @@ void QuadExtractor::cleanupTriangles()
             Edge rung = startEdge;
             for (;;) {
                 if (length >= maxRouteLength)
+                    return 0;
+                // An interior rung may still have an endpoint on the open edge.
+                if (boundaryVertices[rung.first] || boundaryVertices[rung.second])
                     return 0;
                 // Two rungs sharing a vertex would collapse into each other.
                 for (size_t vertex : { rung.first, rung.second }) {
@@ -4817,6 +4858,13 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
             }
         }
 
+        std::vector<bool> boundaryVertices(m_remeshedVertices.size(), false);
+        for (const auto& edge : edgeFaces)
+            if (m_analysis && m_analysis->supportsRimConstraints() && edge.second.size() == 1) {
+                boundaryVertices[edge.first.first] = true;
+                boundaryVertices[edge.first.second] = true;
+            }
+
         const auto mergedValence = [&](const Edge& edge) {
             std::unordered_set<size_t> neighbors = vertexNeighbors[edge.first];
             const auto& secondNeighbors = vertexNeighbors[edge.second];
@@ -4830,6 +4878,9 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
         bool foundShared = false;
         for (const auto& it : edgeFaces) {
             if (2 != it.second.size())
+                continue;
+            // Midpoint collapse must not pull a boundary endpoint into the surface.
+            if (boundaryVertices[it.first.first] || boundaryVertices[it.first.second])
                 continue;
             if (rejectedEdges.end() != rejectedEdges.find(it.first))
                 continue;

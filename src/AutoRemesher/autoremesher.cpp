@@ -95,7 +95,7 @@ namespace {
         Creases,
         Diagonals };
     struct LayoutQuality {
-        double angle = 0, error = 0, area = 0, weight = 0;
+        double angle = 0, error = 0, area = 0, weight = 0, rimError = 0;
         size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0;
     };
     LayoutQuality measureLayout(QuadExtractor& mesh, const SurfaceAnalysis& reference, double sourceArea)
@@ -132,6 +132,17 @@ namespace {
         }
         // Authored holes and trimmed borders are geometry, not extraction defects.
         for (const auto& e : edges) {
+            // Measure local rim displacement separately from holes inside the surface.
+            if (e.second == 1 && reference.supportsRimConstraints()) {
+                const Vector3 a = points[e.first.first], b = points[e.first.second];
+                for (const Vector3 p : { a, b, (a + b) * .5 }) {
+                    auto binding = reference.bindCurve(p, reference.length(), true);
+                    if (binding.chain != SurfaceMesh::npos) {
+                        binding.vertex = SurfaceMesh::npos;
+                        q.rimError = std::max(q.rimError, (p - reference.projectCurve(binding, p)).lengthSquared());
+                    }
+                }
+            }
             q.boundary += e.second == 1 && !reference.onSourceBoundary((points[e.first.first] + points[e.first.second]) * .5) && !reference.onSourceBoundary(points[e.first.first], points[e.first.second]);
             q.nonmanifold += e.second > 2;
             q.collapsed += (points[e.first.first] - points[e.first.second]).lengthSquared() <= std::pow(1e-10 * reference.length(), 2);
@@ -171,13 +182,18 @@ namespace {
         std::cerr << "Candidate quality (angle/error/area/boundary/parts/collapsed): "
                   << a.angle << '/' << a.error << '/' << a.area << '/' << a.boundary << '/' << a.parts << '/' << a.collapsed << " -> "
                   << b.angle << '/' << b.error << '/' << b.area << '/' << b.boundary << '/' << b.parts << '/' << b.collapsed << '\n';
+        // Prefer jointly better boundary fitting and surface quality, even when
+        // a different polygon subdivision changes the count of unmatched edges.
+        const bool recoverRim = reference.supportsRimConstraints() && b.rimError < a.rimError && b.error <= a.error && b.angle <= a.angle && b.area <= a.area + .03 && b.parts <= a.parts;
         // Small curved forms can disappear without losing much total area.
         const bool recoverForm = a.area > .03 || (a.error > std::pow(.05 * reference.length(), 2) && b.error < a.error * .5 && b.boundary <= a.boundary);
         // A large area/angle recovery may slightly raise centroid-sampled error.
         // Bound this allowance to the diagonal proposal, with no new openings.
         const bool recoverArea = preparation == PreparationRecovery::Diagonals && b.parts == 1 && b.area < a.area * .5 && b.angle < a.angle && b.boundary <= a.boundary;
         const double fittingLimit = std::max(a.error * (recoverArea ? 1.05 : 1.), std::pow(.05 * reference.length(), 2));
-        return b.corners && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15))) && ((recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
+        // Keep the same one-tenth-cell tolerance used to recognize authored rims.
+        const bool keepsRim = b.rimError <= std::max(a.rimError, std::pow(.1 * reference.length(), 2));
+        return b.corners && keepsRim && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15))) && (recoverRim || (recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
                    // Closing unintended holes permits small angle distortion, while
                    // retaining fitting and connectivity limits. Closing boundary edges
                    // may replace them with a small number of nonquad repair faces.

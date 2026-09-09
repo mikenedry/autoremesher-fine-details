@@ -51,7 +51,7 @@ public:
         // step of the whole pipeline and would otherwise be one silent block.
         const ProgressHandler* progressHandler = nullptr,
         const std::vector<char>* featureCorners = nullptr, bool featureLayout = false,
-        const SurfaceGuidance* sizing = nullptr);
+        const SurfaceGuidance* sizing = nullptr, bool preserveBoundary = false);
 };
 
 }
