@@ -760,26 +760,35 @@ SurfaceAnalysis::CurveBinding SurfaceAnalysis::bindCurve(const Vector3& p, doubl
     CurveBinding result;
     if (!m_tree || !(radius > 0))
         return result;
-    std::vector<AxisAlignedBoudingBox> query(1);
-    query[0].update(::Vector3(p.x() - radius, p.y() - radius, p.z() - radius));
-    query[0].update(::Vector3(p.x() + radius, p.y() + radius, p.z() + radius));
-    query[0].updateCenter();
-    AxisAlignedBoudingBoxTree tree(&query, { 0 }, query[0]);
-    std::vector<std::pair<size_t, size_t>> hits;
-    m_tree->test(m_tree->root(), tree.root(), &query, &hits);
+    AxisAlignedBoudingBox query;
+    query.update(::Vector3(p.x() - radius, p.y() - radius, p.z() - radius));
+    query.update(::Vector3(p.x() + radius, p.y() + radius, p.z() + radius));
     double best = radius * radius;
-    for (const auto& hit : hits)
-        for (size_t c = 3 * hit.first; c < 3 * hit.first + 3; ++c)
-            if (m_cornerChain[c] != SurfaceMesh::npos && m_chains[m_cornerChain[c]].strength > 0) {
-                if (boundaryOnly && !m_mesh.isBoundaryCorner(c))
-                    continue;
-                const Vector3 a = m_mesh.position(m_mesh.cornerVertex(c)), b = a + m_mesh.edgeVector(c);
-                const double distance = (p - segmentPoint(p, a, b)).lengthSquared();
-                if (distance < best || (distance == best && m_cornerChain[c] < result.chain)) {
-                    best = distance;
-                    result.chain = m_cornerChain[c];
+    const auto visit = [&](const auto& self, const AxisAlignedBoudingBoxTree::Node* node) -> void {
+        if (!node->boundingBox.intersectWith(query))
+            return;
+        if (!node->isLeaf()) {
+            self(self, node->left);
+            self(self, node->right);
+            return;
+        }
+        for (size_t f : node->boxIndices) {
+            if (!m_boxes[f].intersectWith(query))
+                continue;
+            for (size_t c = 3 * f; c < 3 * f + 3; ++c)
+                if (m_cornerChain[c] != SurfaceMesh::npos && m_chains[m_cornerChain[c]].strength > 0) {
+                    if (boundaryOnly && !m_mesh.isBoundaryCorner(c))
+                        continue;
+                    const Vector3 a = m_mesh.position(m_mesh.cornerVertex(c)), b = a + m_mesh.edgeVector(c);
+                    const double distance = (p - segmentPoint(p, a, b)).lengthSquared();
+                    if (distance < best || (distance == best && m_cornerChain[c] < result.chain)) {
+                        best = distance;
+                        result.chain = m_cornerChain[c];
+                    }
                 }
-            }
+        }
+    };
+    visit(visit, m_tree->root());
     if (result.chain != SurfaceMesh::npos && !m_chains[result.chain].closed) {
         const auto& chain = m_chains[result.chain];
         double closest = .25 * radius * radius;
