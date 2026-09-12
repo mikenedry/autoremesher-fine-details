@@ -1242,6 +1242,7 @@ bool AutoRemesher::remesh()
             std::cerr << "Count feedback: " << thread.feedbackBefore << " -> " << count
                       << " target " << thread.island->targetQuads << " accepted " << thread.feedbackAccepted << '\n';
         }
+        thread.remesher->restoreBoundary();
         curveVertices += thread.remesher->constrainedCurveVertices();
         const auto& quads = thread.remesher->remeshedQuads();
         if (quads.empty())

@@ -377,6 +377,12 @@ void QuadExtractor::extractEdges(const std::set<std::pair<size_t, size_t>>& conn
     }
 }
 
+void QuadExtractor::restoreBoundary()
+{
+    if (m_analysis)
+        m_analysis->restoreRoundBoundary(m_remeshedVertices, m_remeshedPolygons);
+}
+
 void QuadExtractor::simplifyGraph(std::unordered_map<size_t, std::unordered_set<size_t>>& graph,
     const std::vector<Vector3>& points)
 {

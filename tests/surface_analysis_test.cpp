@@ -304,9 +304,57 @@ static void missingSurface()
     require(std::isinf(reference.missingSurfaceError({}, {})), "empty output has finite fitting error");
 }
 
+static void roundRimRecovery()
+{
+    const size_t sides = 64, rings = 8;
+    std::vector<V> source { V(0, 0, 0) };
+    std::vector<std::vector<size_t>> triangles, quads;
+    for (size_t r = 1; r <= rings; ++r)
+        for (size_t i = 0; i < sides; ++i) {
+            const double angle = 2 * M_PI * i / sides;
+            source.emplace_back(double(r) / rings * std::cos(angle), double(r) / rings * std::sin(angle), 0);
+        }
+    for (size_t i = 0; i < sides; ++i) {
+        quads.push_back({ 0, 1 + i, 1 + (i + 1) % sides });
+        triangles.push_back(quads.back());
+    }
+    for (size_t r = 1; r < rings; ++r)
+        for (size_t i = 0; i < sides; ++i) {
+            const size_t a = 1 + (r - 1) * sides + i, b = 1 + (r - 1) * sides + (i + 1) % sides;
+            quads.push_back({ a, a + sides, b + sides, b });
+            triangles.push_back({ a, a + sides, b + sides });
+            triangles.push_back({ a, b + sides, b });
+        }
+    auto output = source;
+    for (size_t i = 0; i < sides; ++i)
+        output[1 + (rings - 1) * sides + i] *= i % 2 ? .84 : .98;
+    const auto dented = output;
+    SurfaceAnalysis round(SurfaceMesh(source, triangles), .08, 90, 0, 0, false, false);
+    require(round.restoreRoundBoundary(output, quads) == sides, "round rim recovery declined a dented disk");
+    for (size_t i = 0; i < sides; ++i)
+        require(std::fabs(output[1 + (rings - 1) * sides + i].length() - 1) < 1e-8, "round rim retained a dent");
+    require(output[0].lengthSquared() == 0, "rim recovery moved the fixed interior");
+    auto tilted = source;
+    output = dented;
+    const auto pose = [](V v) { return V(3 + 7 * v.z(), 2 + 7 * v.x(), 1 + 7 * v.y()); };
+    for (auto& v : tilted) v = pose(v);
+    for (auto& v : output) v = pose(v);
+    SurfaceAnalysis rotated(SurfaceMesh(tilted, triangles), .56, 90, 0, 0, false, false);
+    require(rotated.restoreRoundBoundary(output, quads) == sides, "rim recovery depends on axis or scale");
+    for (size_t i = 0; i < sides; ++i)
+        require(std::fabs((output[1 + (rings - 1) * sides + i] - pose(V())).length() - 7) < 1e-7, "posed rim retained a dent");
+    for (auto& v : source) v = V(v.x(), .7 * v.y(), v.z());
+    SurfaceAnalysis ellipse(SurfaceMesh(source, triangles), .08, 90, 0, 0, false, false);
+    output = dented;
+    require(ellipse.restoreRoundBoundary(output, quads) == 0, "elliptical opening was forced round");
+    for (size_t i = 0; i < output.size(); ++i)
+        require((output[i] - dented[i]).lengthSquared() == 0, "rejected rim recovery was not atomic");
+}
+
 int main()
 {
     try {
+        roundRimRecovery();
         missingSurface();
         curvedProtectedTube();
         protectedJunctions();

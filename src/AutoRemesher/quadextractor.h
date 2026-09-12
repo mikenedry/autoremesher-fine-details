@@ -55,6 +55,8 @@ public:
         return m_remeshedPolygons;
     }
 
+    void restoreBoundary();
+
     // The raw connections produced by extractConnections(), before graph cleanup.
     const std::vector<std::pair<Vector3, Vector3>>& extractedConnections() const
     {
