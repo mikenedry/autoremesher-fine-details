@@ -4,8 +4,8 @@
 #include <array>
 #include <cmath>
 #include <functional>
-#include <numeric>
 #include <map>
+#include <numeric>
 #include <queue>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
@@ -1017,5 +1017,302 @@ SurfaceGuidance SurfaceAnalysis::transfer(const SurfaceMesh& mesh, bool sameTopo
         face.ratio = std::pow(m_faces[source].ratio, 2 * alignment * alignment - 1);
     }
     return result;
+}
+namespace {
+    struct RoundRim {
+        Vector3 center, u, v, normal;
+        double radius = 0;
+    };
+
+    // Recognize a round opening only when every source sample agrees at both
+    // mesh scale and cell scale. An ellipse, corner, or second opening rejects it.
+    bool fitRoundRim(const SurfaceMesh& mesh, double length, RoundRim& rim)
+    {
+        std::vector<Vector3> points;
+        Vector3 origin, orientedArea;
+        for (size_t c = 0; c < mesh.cornerCount(); ++c)
+            if (mesh.isBoundaryCorner(c)) {
+                points.push_back(mesh.position(mesh.cornerVertex(c)));
+                origin += points.back();
+            }
+        if (points.size() < 16)
+            return false;
+        origin /= double(points.size());
+        Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+        for (const auto& p : points) {
+            const auto d = p - origin;
+            const Eigen::Vector3d x(d.x(), d.y(), d.z());
+            covariance += x * x.transpose();
+        }
+        for (size_t c = 0; c < mesh.cornerCount(); ++c)
+            if (mesh.isBoundaryCorner(c))
+                orientedArea += Vector3::crossProduct(mesh.position(mesh.cornerVertex(c)) - origin,
+                    mesh.position(mesh.cornerVertex(mesh.nextCorner(c))) - origin);
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(covariance);
+        if (eig.info() != Eigen::Success || orientedArea.lengthSquared() < 1e-20)
+            return false;
+        const auto n = eig.eigenvectors().col(0);
+        rim.normal = Vector3(n[0], n[1], n[2]);
+        if (dot(rim.normal, orientedArea) < 0)
+            rim.normal = -rim.normal;
+        rim.u = points.front() - origin;
+        rim.u = (rim.u - dot(rim.u, rim.normal) * rim.normal).normalized();
+        rim.v = Vector3::crossProduct(rim.normal, rim.u);
+        Eigen::Matrix3d lhs = Eigen::Matrix3d::Zero();
+        Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+        for (const auto& p : points) {
+            const double x = dot(p - origin, rim.u), y = dot(p - origin, rim.v);
+            const Eigen::Vector3d row(x, y, 1);
+            lhs += row * row.transpose();
+            rhs += row * (x * x + y * y);
+        }
+        const Eigen::Vector3d fit = lhs.ldlt().solve(rhs);
+        if (!fit.allFinite())
+            return false;
+        const double x = .5 * fit[0], y = .5 * fit[1];
+        rim.radius = std::sqrt(fit[2] + x * x + y * y);
+        rim.center = origin + x * rim.u + y * rim.v;
+        if (!std::isfinite(rim.radius) || rim.radius < 4 * length)
+            return false;
+        const double tolerance = std::min(.6 * length, .02 * rim.radius);
+        for (const auto& p : points) {
+            const auto d = p - rim.center;
+            if (std::fabs(dot(d, rim.normal)) > tolerance
+                || std::fabs(std::hypot(dot(d, rim.u), dot(d, rim.v)) - rim.radius) > tolerance)
+                return false;
+        }
+        return true;
+    }
+
+    // Least-squares monotone angles (pool adjacent violators), with a small gap
+    // between samples. Nearest-point projection alone reverses the teeth of a rim.
+    // Algorithm background: https://www.jstatsoft.org/article/view/v032i05
+    bool roundRimTargets(const RoundRim& rim, double length, std::vector<size_t> loop, const std::vector<Vector3>& vertices,
+        std::vector<Vector3>& targets)
+    {
+        std::vector<double> angles;
+        double error = 0;
+        for (size_t v : loop) {
+            const auto p = vertices[v] - rim.center;
+            const double a = std::atan2(dot(p, rim.v), dot(p, rim.u));
+            const auto q = rim.center + rim.radius * (std::cos(a) * rim.u + std::sin(a) * rim.v);
+            error = std::max(error, (vertices[v] - q).length());
+            angles.push_back(a);
+        }
+        if (error < .5 * length || error > 4 * length)
+            return false;
+        double winding = 0;
+        for (size_t i = 0; i < angles.size(); ++i)
+            winding += std::remainder(angles[(i + 1) % angles.size()] - angles[i], 2 * M_PI);
+        if (std::fabs(std::fabs(winding) - 2 * M_PI) > .1)
+            return false;
+        if (winding < 0) {
+            std::reverse(loop.begin(), loop.end());
+            std::reverse(angles.begin(), angles.end());
+        }
+        size_t seam = 0;
+        double largest = -2 * M_PI;
+        for (size_t i = 0; i < angles.size(); ++i) {
+            const double gap = std::remainder(angles[(i + 1) % angles.size()] - angles[i], 2 * M_PI);
+            if (gap > largest) {
+                largest = gap;
+                seam = (i + 1) % angles.size();
+            }
+        }
+        std::rotate(loop.begin(), loop.begin() + seam, loop.end());
+        std::rotate(angles.begin(), angles.begin() + seam, angles.end());
+        const auto raw = angles;
+        for (size_t i = 1; i < angles.size(); ++i)
+            angles[i] = angles[i - 1] + std::remainder(raw[i] - raw[i - 1], 2 * M_PI);
+        const double gap = M_PI / loop.size();
+        struct Block {
+            size_t first, count;
+            double sum;
+        };
+        std::vector<Block> blocks;
+        for (size_t i = 0; i < angles.size(); ++i) {
+            blocks.push_back({ i, 1, angles[i] - i * gap });
+            while (blocks.size() > 1) {
+                const auto b = blocks.back();
+                auto& a = blocks[blocks.size() - 2];
+                if (a.sum / a.count <= b.sum / b.count)
+                    break;
+                a.sum += b.sum;
+                a.count += b.count;
+                blocks.pop_back();
+            }
+        }
+        for (const auto& b : blocks)
+            for (size_t i = b.first; i < b.first + b.count; ++i)
+                angles[i] = b.sum / b.count + i * gap;
+        if (angles.back() - angles.front() >= 2 * M_PI - gap)
+            return false;
+        for (size_t i = 0; i < loop.size(); ++i)
+            targets[loop[i]] = rim.center + rim.radius * (std::cos(angles[i]) * rim.u + std::sin(angles[i]) * rim.v);
+        return true;
+    }
+}
+
+size_t SurfaceAnalysis::restoreRoundBoundary(
+    std::vector<Vector3>& vertices, const std::vector<std::vector<size_t>>& faces) const
+{
+    if (!m_hasBoundary || m_preserveRim || vertices.empty())
+        return 0;
+    RoundRim rim;
+    if (!fitRoundRim(m_mesh, m_length, rim))
+        return 0;
+    std::map<std::pair<size_t, size_t>, size_t> edgeUses;
+    std::vector<std::unordered_set<size_t>> neighbors(vertices.size());
+    for (const auto& f : faces) {
+        for (size_t i = 0; i < f.size(); ++i) {
+            const size_t a = f[i], b = f[(i + 1) % f.size()];
+            ++edgeUses[std::minmax(a, b)];
+            neighbors[a].insert(b);
+            neighbors[b].insert(a);
+        }
+        for (size_t i = 2; i + 1 < f.size(); ++i) {
+            neighbors[f[0]].insert(f[i]);
+            neighbors[f[i]].insert(f[0]);
+        }
+    }
+    std::vector<size_t> successor(vertices.size(), SurfaceMesh::npos), degree(vertices.size());
+    for (const auto& f : faces)
+        for (size_t i = 0; i < f.size(); ++i) {
+            const size_t a = f[i], b = f[(i + 1) % f.size()];
+            if (edgeUses[std::minmax(a, b)] == 1) {
+                successor[a] = b;
+                ++degree[a];
+                ++degree[b];
+            }
+        }
+    auto targets = vertices;
+    std::vector<bool> visited(vertices.size()), boundary(vertices.size());
+    size_t count = 0;
+    for (size_t start = 0; start < vertices.size(); ++start)
+        if (degree[start] && !visited[start]) {
+            std::vector<size_t> loop;
+            size_t v = start;
+            do {
+                if (v == SurfaceMesh::npos || visited[v] || degree[v] != 2)
+                    break;
+                visited[v] = true;
+                loop.push_back(v);
+                v = successor[v];
+            } while (v != start);
+            if (v != start || loop.size() < 16 || !roundRimTargets(rim, m_length, loop, vertices, targets))
+                continue;
+            for (size_t id : loop)
+                boundary[id] = true;
+            count += loop.size();
+        }
+    if (!count)
+        return 0;
+    // Move the collar with its boundary, holding the fourth row fixed. Fan
+    // diagonals give the relaxation the same triangles used by validity checks.
+    std::vector<int> band(vertices.size(), 5);
+    for (size_t v = 0; v < vertices.size(); ++v)
+        if (boundary[v])
+            band[v] = 0;
+    for (int k = 1; k <= 4; ++k)
+        for (size_t v = 0; v < vertices.size(); ++v)
+            if (band[v] == k - 1)
+                for (size_t n : neighbors[v])
+                    band[n] = std::min(band[n], k);
+    auto proposed = vertices;
+    for (size_t pass = 0; pass < 4; ++pass) {
+        for (size_t v = 0; v < vertices.size(); ++v)
+            if (boundary[v])
+                proposed[v] = targets[v];
+        auto next = proposed;
+        for (size_t sweep = 0; sweep < 80; ++sweep) {
+            for (size_t v = 0; v < vertices.size(); ++v)
+                if (band[v] > 0 && band[v] < 4) {
+                    Vector3 sum;
+                    for (size_t n : neighbors[v])
+                        sum += proposed[n];
+                    next[v] = sum / double(neighbors[v].size());
+                }
+            proposed.swap(next);
+        }
+        for (size_t v = 0; v < vertices.size(); ++v)
+            if (band[v] > 0 && band[v] < 4) {
+                const size_t f = nearestFace(proposed[v]);
+                if (f != SurfaceMesh::npos)
+                    proposed[v] = trianglePoint(m_mesh, f, proposed[v]);
+            }
+        // Position-based signed-area constraints keep the collar from folding.
+        // Alternate the rim plane and each polygon's normal for nonplanar quads.
+        // Constraint projection: https://matthias-research.github.io/pages/publications/posBasedDyn.pdf
+        for (size_t sweep = 0; sweep < 320; ++sweep) {
+            size_t adjusted = 0;
+            for (const auto& f : faces) {
+                Vector3 oldNormal, normal;
+                for (size_t k = 1; k + 1 < f.size(); ++k) {
+                    oldNormal
+                        += Vector3::crossProduct(vertices[f[k]] - vertices[f[0]], vertices[f[k + 1]] - vertices[f[0]]);
+                    normal
+                        += Vector3::crossProduct(proposed[f[k]] - proposed[f[0]], proposed[f[k + 1]] - proposed[f[0]]);
+                }
+                const double area = oldNormal.length();
+                if (area < 1e-20)
+                    continue;
+                normal = sweep % 2 ? normal.normalized() : rim.normal;
+                for (size_t k = 1; k + 1 < f.size(); ++k) {
+                    const size_t id[3] = { f[0], f[k], f[k + 1] };
+                    const double signedArea = dot(
+                        Vector3::crossProduct(proposed[id[1]] - proposed[id[0]], proposed[id[2]] - proposed[id[0]]),
+                        normal);
+                    const double minimum = .02 * area / (f.size() - 2);
+                    if (signedArea >= minimum)
+                        continue;
+                    Vector3 gradient[3];
+                    double norm = 0;
+                    for (size_t j = 0; j < 3; ++j)
+                        if (band[id[j]] > 0 && band[id[j]] < 4) {
+                            gradient[j]
+                                = Vector3::crossProduct(proposed[id[(j + 1) % 3]] - proposed[id[(j + 2) % 3]], normal);
+                            norm += gradient[j].lengthSquared();
+                        }
+                    if (norm < 1e-20)
+                        continue;
+                    ++adjusted;
+                    for (size_t j = 0; j < 3; ++j)
+                        proposed[id[j]] += gradient[j] * ((minimum - signedArea) / norm);
+                }
+            }
+            if (!adjusted && sweep % 2)
+                break;
+        }
+    }
+    // Commit atomically. Existing curved/concave faces outside the corrected
+    // collar do not license new folded polygons or new reversed projections.
+    for (const auto& f : faces) {
+        Vector3 before, after;
+        bool changed = false;
+        for (size_t v : f) {
+            changed |= (vertices[v] - proposed[v]).lengthSquared() > 1e-20;
+            if (!std::isfinite(proposed[v].x()) || !std::isfinite(proposed[v].y()) || !std::isfinite(proposed[v].z()))
+                return 0;
+        }
+        if (!changed)
+            continue;
+        for (size_t k = 1; k + 1 < f.size(); ++k) {
+            before += Vector3::crossProduct(vertices[f[k]] - vertices[f[0]], vertices[f[k + 1]] - vertices[f[0]]);
+            after += Vector3::crossProduct(proposed[f[k]] - proposed[f[0]], proposed[f[k + 1]] - proposed[f[0]]);
+        }
+        bool oldFold = false, newFold = false;
+        for (size_t k = 1; k + 1 < f.size(); ++k) {
+            const auto a = Vector3::crossProduct(vertices[f[k]] - vertices[f[0]], vertices[f[k + 1]] - vertices[f[0]]);
+            const auto b = Vector3::crossProduct(proposed[f[k]] - proposed[f[0]], proposed[f[k + 1]] - proposed[f[0]]);
+            oldFold |= dot(a, before) <= 0;
+            newFold |= dot(b, after) <= 0;
+            if (dot(a, rim.normal) > 0 && dot(b, rim.normal) <= 0)
+                return 0;
+        }
+        if ((!oldFold && newFold) || after.lengthSquared() < 1e-12 * before.lengthSquared())
+            return 0;
+    }
+    vertices.swap(proposed);
+    return count;
 }
 }
