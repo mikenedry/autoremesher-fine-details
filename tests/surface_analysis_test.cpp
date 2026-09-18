@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <type_traits>
 static_assert(!std::is_move_constructible<AutoRemesher::SurfaceAnalysis>::value, "analysis tree storage must stay put");
@@ -351,9 +352,66 @@ static void roundRimRecovery()
         require((output[i] - dented[i]).lengthSquared() == 0, "rejected rim recovery was not atomic");
 }
 
+static void residualHoles()
+{
+    // A concave prism: removing the top requires more than a convex fan.
+    std::vector<V> points;
+    for (double z : { 0., 1. })
+        for (auto xy : { V(0, 0, 0), V(2, 0, 0), V(2, 1, 0), V(1, 1, 0), V(1, 2, 0), V(0, 2, 0) })
+            points.emplace_back(xy.x(), xy.y(), z);
+    std::vector<std::vector<size_t>> source;
+    for (size_t i = 0; i < 6; ++i) {
+        const size_t j = (i + 1) % 6;
+        source.push_back({ i, j, j + 6 });
+        source.push_back({ i, j + 6, i + 6 });
+    }
+    const std::vector<std::vector<size_t>> cap { { 0, 1, 3 }, { 1, 2, 3 }, { 0, 3, 5 }, { 3, 4, 5 } };
+    for (auto face : cap) {
+        std::reverse(face.begin(), face.end());
+        source.push_back(face);
+    }
+    const auto open = source;
+    for (auto face : cap) {
+        for (auto& v : face) v += 6;
+        source.push_back(face);
+    }
+    SurfaceAnalysis closed(SurfaceMesh(points, source), .2, 90, 0, 0, false, false);
+    const auto watertight = [](const std::vector<std::vector<size_t>>& faces) {
+        std::map<std::pair<size_t, size_t>, size_t> edges;
+        for (const auto& f : faces)
+            for (size_t i = 0; i < f.size(); ++i)
+                ++edges[{ f[i], f[(i + 1) % f.size()] }];
+        for (const auto& e : edges)
+            require(e.second == 1 && edges[{ e.first.second, e.first.first }] == 1, "repair left an opening or duplicated a directed edge");
+    };
+    auto output = open;
+    require(closed.closeBoundaryHoles(points, output) == 1, "concave hole was not filled");
+    require(std::equal(open.begin(), open.end(), output.begin()), "hole repair changed existing faces");
+    watertight(output);
+    require(closed.closeBoundaryHoles(points, output) == 0, "closed mesh was modified again");
+    SurfaceAnalysis intentional(SurfaceMesh(points, open), .2, 90, 0, 0, false, false);
+    output = open;
+    require(intentional.closeBoundaryHoles(points, output) == 0 && output == open, "source opening was capped");
+    // A source orientation seam is not an open border.
+    auto inconsistent = source;
+    std::reverse(inconsistent[0].begin(), inconsistent[0].end());
+    SurfaceAnalysis seam(SurfaceMesh(points, inconsistent), .2, 90, 0, 0, false, false);
+    output = open;
+    require(seam.closeBoundaryHoles(points, output) == 1, "source orientation seam hid an accidental hole");
+    watertight(output);
+    // Split one corner of an existing triangle without changing its position.
+    points.push_back(points[0]);
+    output = source;
+    output[0][0] = points.size() - 1;
+    require(closed.closeBoundaryHoles(points, output) == 1, "coincident seam was not sewn");
+    require(output.size() == source.size(), "seam repair introduced a zero-area cap");
+    watertight(output);
+}
+
 int main()
 {
     try {
+        residualHoles();
         roundRimRecovery();
         missingSurface();
         curvedProtectedTube();

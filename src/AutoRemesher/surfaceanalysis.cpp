@@ -1315,4 +1315,223 @@ size_t SurfaceAnalysis::restoreRoundBoundary(
     vertices.swap(proposed);
     return count;
 }
+// Repair only short, simple loops away from original openings. The expensive
+// work is bounded by loop length; the rest is one edge-incidence scan.
+size_t SurfaceAnalysis::closeBoundaryHoles(std::vector<Vector3>& vertices,
+    std::vector<std::vector<size_t>>& faces) const
+{
+    using Edge = std::pair<size_t, size_t>;
+    std::map<Edge, size_t> directed;
+    std::vector<std::vector<size_t>> incident(vertices.size());
+    for (size_t f = 0; f < faces.size(); ++f)
+        for (size_t i = 0; i < faces[f].size(); ++i) {
+            ++directed[{ faces[f][i], faces[f][(i + 1) % faces[f].size()] }];
+            incident[faces[f][i]].push_back(f);
+        }
+    const auto uses = [&](size_t a, size_t b) {
+        const auto it = directed.find({ a, b });
+        return it == directed.end() ? size_t(0) : it->second;
+    };
+    const size_t none = SurfaceMesh::npos;
+    std::vector<size_t> next(vertices.size(), none), degree(vertices.size());
+    for (const auto& e : directed)
+        if (e.second == 1 && uses(e.first.second, e.first.first) == 0) {
+            next[e.first.first] = e.first.second;
+            ++degree[e.first.first];
+            ++degree[e.first.second];
+        }
+    // Adjacency can detach folded or inconsistently wound source triangles.
+    // Only an edge used by one source face is an intentional opening.
+    std::vector<size_t> sourceBoundary;
+    if (m_hasBoundary)
+        for (size_t c = 0; c < m_mesh.cornerCount(); ++c) {
+            if (!m_mesh.isBoundaryCorner(c))
+                continue;
+            const size_t a = m_mesh.cornerVertex(c), b = m_mesh.cornerVertex(m_mesh.nextCorner(c));
+            size_t count = 0;
+            for (size_t corner : m_mesh.cornersAroundVertex(a)) {
+                count += m_mesh.cornerVertex(m_mesh.nextCorner(corner)) == b;
+                count += m_mesh.cornerVertex(m_mesh.previousCorner(corner)) == b;
+            }
+            if (count == 1)
+                sourceBoundary.push_back(c);
+        }
+    std::vector<bool> visited(vertices.size());
+    size_t repaired = 0;
+    for (size_t start = 0; start < degree.size(); ++start) {
+        if (!degree[start] || visited[start])
+            continue;
+        std::vector<size_t> loop;
+        size_t v = start;
+        do {
+            if (v == none || visited[v] || degree[v] != 2)
+                break;
+            visited[v] = true;
+            loop.push_back(v);
+            v = next[v];
+        } while (v != start);
+        if (v != start || loop.size() < 3 || loop.size() > 64)
+            continue;
+        double length = 0;
+        for (size_t i = 0; i < loop.size(); ++i)
+            length = std::max(length, (vertices[loop[i]] - vertices[loop[(i + 1) % loop.size()]]).length());
+        if (!(length > 0))
+            continue;
+        if (std::any_of(loop.begin(), loop.end(), [&](size_t id) {
+                for (size_t c : sourceBoundary) {
+                    const auto a = m_mesh.position(m_mesh.cornerVertex(c));
+                    const auto b = m_mesh.position(m_mesh.cornerVertex(m_mesh.nextCorner(c)));
+                    const double radius = std::max(m_length, length);
+                    if ((vertices[id] - segmentPoint(vertices[id], a, b)).lengthSquared() <= radius * radius)
+                        return true;
+                }
+                return false;
+            }))
+            continue;
+        // A two-edge slit can have different indices at exactly the same
+        // position. Sew it only if no face or directed edge becomes duplicated.
+        for (size_t i = 0; loop.size() >= 4 && i < loop.size();) {
+            const size_t keep = loop[i], retired = loop[(i + 2) % loop.size()];
+            bool safe = (vertices[keep] - vertices[retired]).lengthSquared() == 0;
+            std::map<Edge, int> delta;
+            if (safe)
+                for (size_t f : incident[retired]) {
+                    const auto& face = faces[f];
+                    if (std::find(face.begin(), face.end(), keep) != face.end()) {
+                        safe = false;
+                        break;
+                    }
+                    for (size_t k = 0; k < face.size(); ++k) {
+                        const size_t a = face[k], b = face[(k + 1) % face.size()];
+                        --delta[{ a, b }];
+                        ++delta[{ a == retired ? keep : a, b == retired ? keep : b }];
+                    }
+                }
+            for (const auto& d : delta) {
+                const auto e = d.first;
+                const int count = int(uses(e.first, e.second)) + d.second;
+                if (count < 0 || count > 1)
+                    safe = false;
+            }
+            if (!safe) {
+                ++i;
+                continue;
+            }
+            for (const auto& d : delta) {
+                const int count = int(uses(d.first.first, d.first.second)) + d.second;
+                if (count)
+                    directed[d.first] = size_t(count);
+                else
+                    directed.erase(d.first);
+            }
+            for (size_t f : incident[retired]) {
+                std::replace(faces[f].begin(), faces[f].end(), retired, keep);
+                incident[keep].push_back(f);
+            }
+            incident[retired].clear();
+            std::rotate(loop.begin(), loop.begin() + i, loop.end());
+            loop.erase(loop.begin() + 1, loop.begin() + 3);
+            i = 0;
+        }
+        if (loop.size() < 3) {
+            ++repaired;
+            continue;
+        }
+        std::reverse(loop.begin(), loop.end()); // Opposite the existing faces.
+        const size_t n = loop.size();
+        Vector3 normal;
+        for (size_t i = 1; i + 1 < n; ++i)
+            normal += Vector3::crossProduct(vertices[loop[i]] - vertices[loop[0]], vertices[loop[i + 1]] - vertices[loop[0]]);
+        normal = normal.normalized();
+        const double infinity = std::numeric_limits<double>::infinity();
+        // Bounded polygon-triangulation dynamic programming; hole-filling background:
+        // https://doi.org/10.2312/SGP/SGP03/200-206 (the cost here also uses source distance).
+        std::vector<double> cost(n * n, infinity);
+        std::vector<size_t> split(n * n, none);
+        for (size_t i = 0; i + 1 < n; ++i)
+            cost[i * n + i + 1] = 0;
+        for (size_t span = 2; span < n; ++span)
+            for (size_t i = 0; i + span < n; ++i) {
+                const size_t j = i + span;
+                if (span != n - 1 && (uses(loop[i], loop[j]) || uses(loop[j], loop[i])))
+                    continue;
+                for (size_t k = i + 1; k < j; ++k) {
+                    const double previous = cost[i * n + k] + cost[k * n + j];
+                    if (!std::isfinite(previous))
+                        continue;
+                    const auto a = vertices[loop[i]], b = vertices[loop[k]], c = vertices[loop[j]];
+                    const auto cross = Vector3::crossProduct(b - a, c - a);
+                    const double area = cross.length();
+                    if (area < 1e-10 * length * length || dot(cross, normal) <= 0)
+                        continue;
+                    const double distance = surfaceDistanceSquared((a + b + c) / 3);
+                    if (distance > length * length)
+                        continue;
+                    // Prefer a patch close to the source, then well-shaped
+                    // triangles; never add a diagonal already in the mesh.
+                    const double quality = ((a - b).lengthSquared() + (b - c).lengthSquared() + (c - a).lengthSquared()) / area;
+                    const double candidate = previous + quality + 16 * distance / (length * length);
+                    if (candidate < cost[i * n + j]) {
+                        cost[i * n + j] = candidate;
+                        split[i * n + j] = k;
+                    }
+                }
+            }
+        if (split[n - 1] == none) {
+            // Existing interior diagonals can block a boundary-only patch.
+            // A new interior point avoids giving such an edge a third face.
+            Vector3 center;
+            for (size_t id : loop)
+                center += vertices[id] / double(n);
+            const size_t sourceFace = nearestFace(center);
+            if (sourceFace == none)
+                continue;
+            center = trianglePoint(m_mesh, sourceFace, center);
+            // Move into the polygon's visibility kernel: its centroid need
+            // not see every edge of a concave loop. Keep the source depth.
+            for (size_t sweep = 0; sweep < 64; ++sweep) {
+                bool moved = false;
+                for (size_t i = 0; i < n; ++i) {
+                    const auto a = vertices[loop[i]], b = vertices[loop[(i + 1) % n]];
+                    const double deficit = 1e-4 * length * length - dot(Vector3::crossProduct(a - center, b - center), normal);
+                    const auto gradient = Vector3::crossProduct(a - b, normal);
+                    if (deficit > 0 && gradient.lengthSquared() > 0) {
+                        center += gradient * (deficit / gradient.lengthSquared());
+                        moved = true;
+                    }
+                }
+                if (!moved)
+                    break;
+            }
+            bool valid = surfaceDistanceSquared(center) <= length * length;
+            for (size_t i = 0; i < n; ++i) {
+                const auto a = vertices[loop[i]], b = vertices[loop[(i + 1) % n]];
+                valid &= dot(Vector3::crossProduct(a - center, b - center), normal) > 1e-10 * length * length;
+                valid &= surfaceDistanceSquared((a + b + center) / 3) <= length * length;
+            }
+            if (!valid)
+                continue;
+            const size_t added = vertices.size();
+            vertices.push_back(center);
+            for (size_t i = 0; i < n; ++i)
+                faces.push_back({ added, loop[i], loop[(i + 1) % n] });
+            ++repaired;
+            continue;
+        }
+        const auto append = [&](const auto& self, size_t i, size_t j) -> void {
+            if (j <= i + 1)
+                return;
+            const size_t k = split[i * n + j];
+            faces.push_back({ loop[i], loop[k], loop[j] });
+            for (size_t c = 0; c < 3; ++c)
+                ++directed[{ faces.back()[c], faces.back()[(c + 1) % 3] }];
+            self(self, i, k);
+            self(self, k, j);
+        };
+        append(append, 0, n - 1);
+        ++repaired;
+    }
+    return repaired;
+}
+
 }

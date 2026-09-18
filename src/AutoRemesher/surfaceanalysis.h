@@ -42,6 +42,9 @@ public:
         const std::vector<std::vector<size_t>>& faces, size_t iterations = 2) const;
     size_t restoreRoundBoundary(std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& faces) const;
+    // Returns closed loops; preserves source borders and skips ambiguous/large holes.
+    size_t closeBoundaryHoles(std::vector<Vector3>& vertices,
+        std::vector<std::vector<size_t>>& faces) const;
     void relaxSurface(std::vector<Vector3>& vertices,
         const std::vector<std::unordered_set<size_t>>& neighbors,
         const std::vector<bool>& locked, const std::vector<std::vector<size_t>>& polygons, size_t iterations) const;
