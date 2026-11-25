@@ -1,52 +1,48 @@
 cmake_minimum_required(VERSION 3.20)
-project(autoremesher_reference_tests LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-get_filename_component(UPSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
-find_package(TBB REQUIRED)
-
-# Correct upstream's shallow redirect paths in the test build's include overlay.
-file(GLOB redirects "${UPSTREAM}/include/AutoRemesher/*")
-foreach(header IN LISTS redirects)
-    file(READ "${header}" contents)
-    string(REGEX MATCH "src/AutoRemesher/([^\"]+)" match "${contents}")
-    get_filename_component(name "${header}" NAME)
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/overlay/AutoRemesher/${name}"
-        "#include \"${UPSTREAM}/src/AutoRemesher/${CMAKE_MATCH_1}\"\n")
-endforeach()
-file(GLOB engine "${UPSTREAM}/src/AutoRemesher/*.cpp")
-file(GLOB isotropic "${UPSTREAM}/thirdparty/isotropicremesher/*.cpp")
-add_executable(reference_surface_test reference_surface_test.cpp ${engine} ${isotropic}
-    "${UPSTREAM}/thirdparty/meshoptimizer/src/simplifier.cpp"
-    "${UPSTREAM}/thirdparty/meshoptimizer/src/indexgenerator.cpp")
-target_include_directories(reference_surface_test PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/overlay" "${UPSTREAM}/thirdparty/eigen"
-    "${UPSTREAM}/thirdparty/isotropicremesher" "${UPSTREAM}/thirdparty/meshoptimizer/src")
-target_link_libraries(reference_surface_test PRIVATE TBB::tbb)
-if(APPLE)
-    target_compile_definitions(reference_surface_test PRIVATE AUTO_REMESHER_USE_ACCELERATE=1)
-    target_compile_options(reference_surface_test PRIVATE -O3 -flto -funroll-loops)
-    target_link_options(reference_surface_test PRIVATE -flto)
-    target_link_libraries(reference_surface_test PRIVATE TBB::tbbmalloc TBB::tbbmalloc_proxy "-framework Accelerate")
+# Keep the standalone entry point while sharing the core's sources and policy.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(autoremesher_reference_tests LANGUAGES CXX)
+    enable_testing()
+    set(AUTOREMESHER_BUILD_TESTS OFF)
+    set(AUTOREMESHER_BUILD_CLI OFF)
+    add_subdirectory(.. "${CMAKE_CURRENT_BINARY_DIR}/engine")
 endif()
-enable_testing()
+
+foreach(test reference_surface surface_analysis surface_relaxation)
+    add_executable(${test}_test ${test}_test.cpp)
+    target_link_libraries(${test}_test PRIVATE AutoRemesher::core)
+endforeach()
 add_test(NAME preparation_reference COMMAND reference_surface_test)
-
-add_executable(surface_analysis_test surface_analysis_test.cpp
-    "${UPSTREAM}/src/AutoRemesher/surfaceanalysis.cpp"
-    "${UPSTREAM}/src/AutoRemesher/surfacerelaxation.cpp"
-    "${UPSTREAM}/src/AutoRemesher/surfacemesh.cpp"
-    "${UPSTREAM}/thirdparty/isotropicremesher/axisalignedboundingboxtree.cpp")
-target_include_directories(surface_analysis_test PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/overlay" "${UPSTREAM}/thirdparty/eigen"
-    "${UPSTREAM}/thirdparty/isotropicremesher")
-target_link_libraries(surface_analysis_test PRIVATE TBB::tbb)
 add_test(NAME surface_analysis COMMAND surface_analysis_test)
-
-add_executable(surface_relaxation_test surface_relaxation_test.cpp
-    "${UPSTREAM}/src/AutoRemesher/surfacerelaxation.cpp"
-    "${UPSTREAM}/thirdparty/isotropicremesher/axisalignedboundingboxtree.cpp")
-target_include_directories(surface_relaxation_test PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/overlay" "${UPSTREAM}/thirdparty/eigen"
-    "${UPSTREAM}/thirdparty/isotropicremesher")
 add_test(NAME surface_relaxation COMMAND surface_relaxation_test)
+
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/reference/singularity_manifest.json" singularity_manifest)
+string(JSON singularity_sha GET "${singularity_manifest}" sha256)
+set(singularity_reference "${CMAKE_CURRENT_SOURCE_DIR}/reference/singularitysimplifier_fef338d.cpp")
+file(SHA256 "${singularity_reference}" actual_singularity_sha)
+if(NOT actual_singularity_sha STREQUAL singularity_sha)
+    message(FATAL_ERROR "Frozen singularity reference differs from its recorded upstream source")
+endif()
+add_library(reference_singularity OBJECT "${singularity_reference}")
+target_compile_definitions(reference_singularity PRIVATE SingularitySimplifier=ReferenceSingularitySimplifier)
+target_link_libraries(reference_singularity PRIVATE AutoRemesher::core)
+add_executable(singularity_local_test singularity_local_test.cpp $<TARGET_OBJECTS:reference_singularity>)
+target_link_libraries(singularity_local_test PRIVATE AutoRemesher::core)
+add_test(NAME singularity_local COMMAND singularity_local_test)
+
+if(TARGET AutoRemesherEngine)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME headless_cli COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/headless_cli_test.py" "$<TARGET_FILE:AutoRemesherEngine>")
+    set_tests_properties(headless_cli PROPERTIES TIMEOUT 180)
+    add_test(NAME cli_paths COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cli_paths_test.py" "$<TARGET_FILE:AutoRemesherEngine>")
+    set_tests_properties(cli_paths PROPERTIES TIMEOUT 180)
+endif()
+
+add_executable(input_topology_test input_topology_test.cpp)
+target_link_libraries(input_topology_test PRIVATE AutoRemesher::core)
+add_test(NAME input_topology COMMAND input_topology_test)
+set_tests_properties(input_topology PROPERTIES TIMEOUT 120)

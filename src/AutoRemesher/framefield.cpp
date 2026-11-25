@@ -95,8 +95,7 @@ bool FrameField::create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
         const double angle = kSymmetry * tangentAngle(face.direction, facetBases[f]);
         periodic[2 * f] = std::cos(angle);
         periodic[2 * f + 1] = std::sin(angle);
-        const bool feature = guidance->featureCorners[3 * f] ||
-            guidance->featureCorners[3 * f + 1] || guidance->featureCorners[3 * f + 2];
+        const bool feature = guidance->featureCorners[3 * f] || guidance->featureCorners[3 * f + 1] || guidance->featureCorners[3 * f + 2];
         certainty[f] = face.confidence;
         if (taperCurvature && fixedCurvature && !feature && face.confidence >= 1.) {
             // Marginal curvature estimates may disagree across nearby sampling meshes.

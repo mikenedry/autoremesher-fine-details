@@ -116,7 +116,8 @@ namespace {
                 drop = axis;
         const size_t x = (drop + 1) % 3, y = (drop + 2) % 3;
         const auto midpoint = ((points[first] - origin)
-            + (points[second] - origin)) * .5;
+                                  + (points[second] - origin))
+            * .5;
         bool inside = false, onBoundary = false;
         for (size_t i = 0; i < polygon.size(); ++i) {
             const auto a = points[polygon[i]] - origin;
@@ -473,7 +474,8 @@ void QuadExtractor::restoreBoundary()
                 return false;
         }
         return true;
-    }), m_remeshedPolygons.end());
+    }),
+        m_remeshedPolygons.end());
     if (m_remeshedPolygons.size() != before)
         rebuildHalfEdges();
 }
@@ -1164,7 +1166,8 @@ void QuadExtractor::extractConnections(std::vector<Vector3>* crossPoints,
                         double segmentPosition = split[0][0].position2[coordIndex];
                         const int lastSegmentIndex = (int)segments.size() - 1;
                         const int firstSegmentIndex = lastSegmentIndex >= 0 && segmentPosition > prefixUpperBound
-                            ? lastSegmentIndex : 0;
+                            ? lastSegmentIndex
+                            : 0;
                         for (int segmentIndex = lastSegmentIndex; segmentIndex >= firstSegmentIndex; --segmentIndex) {
                             auto& segment = segments[segmentIndex];
                             double fromPosition;
@@ -4975,7 +4978,7 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
         const size_t remove = sharedEdge.second;
         const size_t unmovedVertex = m_remeshedVertices.size();
         Vector3 keepPosition = (m_remeshedVertices[keep]
-                                  + m_remeshedVertices[remove])
+                                   + m_remeshedVertices[remove])
             * 0.5;
         if (m_analysis && m_analysis->openFoldWorkflow()) {
             const auto binding = [&](size_t vertex) {
@@ -4993,7 +4996,9 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
             }
             // Minimize the collapse displacement while retaining an existing curve
             // or fixed source corner. Unbound endpoints retain the ordinary midpoint.
-            const auto& curve = a.vertex != none ? a : b.vertex != none ? b : a.chain != none ? a : b;
+            const auto& curve = a.vertex != none ? a : b.vertex != none ? b
+                : a.chain != none                                       ? a
+                                                                        : b;
             if (curve.chain != none)
                 keepPosition = m_analysis->projectCurve(curve, keepPosition);
         }

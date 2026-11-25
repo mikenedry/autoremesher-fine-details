@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/mikenedry/autoremesher-fine-details",
+  "commit": "fef338d27aeb9c5f0eca12b305538ed670c59776",
+  "source": "src/AutoRemesher/singularitysimplifier.cpp",
+  "file": "singularitysimplifier_fef338d.cpp",
+  "sha256": "5b024fd0551eae0b426941848830e200828ea1b87d823f7d14b5650df4a3c3be",
+  "license": "MIT; original notice retained"
+}

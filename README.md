@@ -28,7 +28,12 @@ Support the original author's work: [donate to Jeremy HU](https://www.paypal.com
 
 These instructions will get you a copy of **AutoRemesher** up and running on your local machine for development.
 
-### Prerequisites
+### Standalone library and CLI (CMake)
+
+The CMake build provides the native library and a Qt-free OBJ driver. See [Standalone library and OBJ driver](docs/HEADLESS.md) for build commands,
+CLI options and source licenses.
+
+### Application prerequisites
 
 - C++ compiler with C++14 support (GCC, Clang, or MSVC)
 - Qt 5.15.2
@@ -47,8 +52,8 @@ sudo apt install build-essential qt5-qmake qtbase5-dev qttools5-dev-tools libqt5
 sudo apt install libtbb-dev libgl1-mesa-dev
 
 # Clone and build
-git clone https://github.com/mikenedry/autoremesher.git
-cd autoremesher
+git clone https://github.com/mikenedry/autoremesher-fine-details.git
+cd autoremesher-fine-details
 qmake
 make -j$(nproc)
 ```
@@ -118,22 +123,23 @@ brew install qt@5 tbb cmake
 
 # Build
 export PATH="/usr/local/opt/qt@5/bin:$PATH"
-git clone https://github.com/mikenedry/autoremesher.git
-cd autoremesher
+git clone https://github.com/mikenedry/autoremesher-fine-details.git
+cd autoremesher-fine-details
 qmake CONFIG+=sdk_no_version_check
 make -j$(sysctl -n hw.logicalcpu)
 ```
 
 ### Running a quick test
 
-AutoRemesher has a CLI mode for headless processing. Try it with one of the [common-3d-test-models](https://github.com/alecjacobson/common-3d-test-models):
+AutoRemesher has a CLI mode for headless processing. Generate a small input mesh to try the packaged application:
 
 ```bash
+python3 tests/cli_test_mesh.py smoke-input.obj
 ./autoremesher \
-    --input armadillo.obj \
+    --input smoke-input.obj \
     --output remeshed.obj \
     --report remeshed_report.txt \
-    --target-quads 50000 \
+    --target-quads 64 \
     --edge-scaling 1.0 \
     --sharp-edge 90.0 \
     --smooth-normal 0.0 \
@@ -179,7 +185,11 @@ $ ./autoremesher-<version>.AppImage
 
 ## License
 
-AutoRemesher is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Unchanged AutoRemesher sources retain the MIT License; see [LICENSE](LICENSE).
+The imported standalone driver, local-charge optimization and its regression
+fixture retain GPL-3.0-or-later; the modified core is not wholly MIT.
+See [headless source and licensing](docs/HEADLESS.md#source-and-licensing)
+for its provenance and license text. Third-party components retain their own notices.
 
 ## Acknowledgements
 

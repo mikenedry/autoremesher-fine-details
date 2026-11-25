@@ -201,9 +201,10 @@ namespace {
             const double score = strict ? 3 - directionDisagreement / neighborCount : confidence * std::sqrt(coverage) + .1 * stability / neighborCount + .002 * s;
             // One supported scale can guide spacing without the neighboring
             // valid scales required to fix a curvature direction.
-            const bool valid = useVertexTensor && samples[s].confidence >= .7 &&
-                samples[s].major * supportRadii[s] >= 1 / 3.7979 && normalAlignment[s] <= .5;
-            const int priority = !openFoldWorkflow ? 0 : strict ? 2 : valid ? 1 : 0;
+            const bool valid = useVertexTensor && samples[s].confidence >= .7 && samples[s].major * supportRadii[s] >= 1 / 3.7979 && normalAlignment[s] <= .5;
+            const int priority = !openFoldWorkflow ? 0 : strict ? 2
+                : valid                                         ? 1
+                                                                : 0;
             if (priority > bestPriority || (priority == bestPriority && score > bestScore)) {
                 bestPriority = priority;
                 bestScore = score;
