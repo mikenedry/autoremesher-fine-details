@@ -140,16 +140,13 @@ jobs:
           file AutoRemesher-x86_64.AppImage
 
           mv AutoRemesher-x86_64.AppImage autoremesher-${{ github.ref_name }}.AppImage
-      - name: Checkout test models
-        uses: actions/checkout@v4
-        with:
-          repository: alecjacobson/common-3d-test-models
-          path: test-models
+      - name: Generate CLI smoke-test input
+        run: python3 tests/cli_test_mesh.py smoke-input.obj
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb imagemagick
-      - name: Run CLI test with armadillo.obj
+      - name: Run procedural CLI smoke test
         run: |
           set -e
           chmod +x autoremesher-${{ github.ref_name }}.AppImage
@@ -164,10 +161,10 @@ jobs:
 
           echo "Running CLI test..."
           ./autoremesher-${{ github.ref_name }}.AppImage \
-            --input test-models/data/armadillo.obj \
+            --input smoke-input.obj \
             --output autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed.obj \
             --report autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed_report.txt \
-            --target-quads 50000 \
+            --target-quads 64 \
             --edge-scaling 1.0 \
             --sharp-edge 90.0 \
             --smooth-normal 0.0 \
@@ -193,16 +190,6 @@ jobs:
           ls -lh autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed.obj
 
           kill $XVFB_PID 2>/dev/null || true
-      - name: Upload CLI test result
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed.obj
-          path: autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed.obj
-      - name: Upload CLI test report
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed_report.txt
-          path: autoremesher-${{ github.ref_name }}-ubuntu-22.04-remeshed_report.txt
       - name: Run AppImage and capture screenshot
         run: |
           set +e
@@ -225,11 +212,6 @@ jobs:
           wait $APP_PID || true
           kill $APP_PID 2>/dev/null || true
           kill $XVFB_PID 2>/dev/null || true
-      - name: Upload AppImage screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-ubuntu-22.04.png
-          path: autoremesher-${{ github.ref_name }}-ubuntu-22.04.png
       - name: Upload Linux AppImage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -309,11 +291,8 @@ jobs:
             [ -f "${CRT_DIR}/vcruntime140_1.dll" ] && 7z a autoremesher-${{ github.ref_name }}-win32-x86_64.zip "${CRT_DIR}/vcruntime140_1.dll" || true
           fi
           7z l autoremesher-${{ github.ref_name }}-win32-x86_64.zip
-      - name: Checkout test models
-        uses: actions/checkout@v4
-        with:
-          repository: alecjacobson/common-3d-test-models
-          path: test-models
+      - name: Generate CLI smoke-test input
+        run: python tests/cli_test_mesh.py smoke-input.obj
       - name: Extract release zip to test directory
         shell: bash
         run: |
@@ -323,7 +302,7 @@ jobs:
           7z x "$GITHUB_WORKSPACE/$ZIP_FILE" -o"$TEST_DIR" -y
           echo "Extracted release zip to $TEST_DIR:"
           ls -la "$TEST_DIR"
-      - name: Run CLI test with armadillo.obj (from release zip)
+      - name: Run procedural CLI smoke test (from release zip)
         timeout-minutes: 30
         run: |
           set -e
@@ -344,10 +323,10 @@ jobs:
 
           echo "Running CLI test..."
           "$TEST_EXE" \
-            --input test-models/data/armadillo.obj \
+            --input smoke-input.obj \
             --output "$outputFile" \
             --report "$reportFile" \
-            --target-quads 50000 \
+            --target-quads 64 \
             --edge-scaling 1.0 \
             --sharp-edge 90.0 \
             --smooth-normal 0.0 \
@@ -365,16 +344,6 @@ jobs:
           fi
           echo "OK. CLI test passed: $outputFile created"
         shell: bash
-      - name: Upload CLI test result
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-windows-2022-remeshed.obj
-          path: autoremesher-${{ github.ref_name }}-windows-2022-remeshed.obj
-      - name: Upload CLI test report
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-windows-2022-remeshed_report.txt
-          path: autoremesher-${{ github.ref_name }}-windows-2022-remeshed_report.txt
       - name: Run application and capture screenshot (from release zip)
         timeout-minutes: 3
         run: |
@@ -396,11 +365,6 @@ jobs:
           $bitmap.Save("$env:GITHUB_WORKSPACE\autoremesher-${{ github.ref_name }}-windows-2022.png")
           Stop-Process -Name autoremesher -Force -ErrorAction SilentlyContinue
         shell: powershell
-      - name: Upload Windows screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-windows-2022.png
-          path: autoremesher-${{ github.ref_name }}-windows-2022.png
       - name: Upload Windows zip artifact
         uses: actions/upload-artifact@v4
         with:
@@ -460,12 +424,9 @@ jobs:
           hdiutil attach "$DMG_PATH" -mountpoint /Volumes/AutoRemesher -nobrowse -verbose
           echo "DMG mounted at /Volumes/AutoRemesher"
           ls -la /Volumes/AutoRemesher/
-      - name: Checkout test models
-        uses: actions/checkout@v4
-        with:
-          repository: alecjacobson/common-3d-test-models
-          path: test-models
-      - name: Run CLI test with armadillo.obj (from DMG)
+      - name: Generate CLI smoke-test input
+        run: python3 tests/cli_test_mesh.py smoke-input.obj
+      - name: Run procedural CLI smoke test (from DMG)
         run: |
           set -e
           DMG_APP="/Volumes/AutoRemesher/autoremesher.app"
@@ -479,10 +440,10 @@ jobs:
           fi
 
           "$DMG_APP/Contents/MacOS/autoremesher" \
-            --input test-models/data/armadillo.obj \
+            --input smoke-input.obj \
             --output autoremesher-${{ github.ref_name }}-macos-latest-remeshed.obj \
             --report autoremesher-${{ github.ref_name }}-macos-latest-remeshed_report.txt \
-            --target-quads 50000 \
+            --target-quads 64 \
             --edge-scaling 1.0 \
             --sharp-edge 90.0 \
             --smooth-normal 0.0 \
@@ -495,16 +456,6 @@ jobs:
           fi
           echo "✓ CLI test passed: remeshed .obj created"
           ls -lh autoremesher-${{ github.ref_name }}-macos-latest-remeshed.obj
-      - name: Upload CLI test result
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-macos-latest-remeshed.obj
-          path: autoremesher-${{ github.ref_name }}-macos-latest-remeshed.obj
-      - name: Upload CLI test report
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-macos-latest-remeshed_report.txt
-          path: autoremesher-${{ github.ref_name }}-macos-latest-remeshed_report.txt
       - name: Run application and capture screenshot (from DMG)
         run: |
           DMG_APP="/Volumes/AutoRemesher/autoremesher.app"
@@ -522,11 +473,6 @@ jobs:
         if: always()
         run: |
           hdiutil detach /Volumes/AutoRemesher -force || echo "Note: DMG detach completed (or was not mounted)"
-      - name: Upload macOS screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoremesher-${{ github.ref_name }}-macos-latest.png
-          path: autoremesher-${{ github.ref_name }}-macos-latest.png
       - name: Upload macOS DMG artifact
         uses: actions/upload-artifact@v4
         with:

@@ -1,3 +1,4 @@
+#include "inputtopology.h"
 #include "surfaceanalysis.h"
 /*
  *  Copyright (c) 2026 Jeremy HU <jeremy-at-dust3d dot org>. All rights reserved.
@@ -31,8 +32,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <iostream>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -217,22 +218,19 @@ namespace {
             && b.angle <= a.angle && b.area <= a.area + .03 && b.boundary <= a.boundary
             && b.parts <= a.parts && b.nonquads <= a.nonquads;
         if (admissible && (recoverCells || recoverRim || (recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
-                   // Closing unintended holes permits small angle distortion, while
-                   // retaining fitting and connectivity limits. Closing boundary edges
-                   // may replace them with a small number of nonquad repair faces.
-                   (a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < std::max(a.angle, .1) && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads + b.boundary <= a.nonquads + a.boundary) ||
-                   // Avoid buying tiny fitting gains with a needlessly dense flat grid.
-                   ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads)))
+                // Closing unintended holes permits small angle distortion, while
+                // retaining fitting and connectivity limits. Closing boundary edges
+                // may replace them with a small number of nonquad repair faces.
+                (a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < std::max(a.angle, .1) && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads + b.boundary <= a.nonquads + a.boundary) ||
+                // Avoid buying tiny fitting gains with a needlessly dense flat grid.
+                ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads)))
             return true;
         // Only unresolved, geometrically admissible comparisons pay for source flow.
         // Existing acceptance and every fitting/topology guard remain authoritative.
-        if (!reference.openFoldWorkflow() || !admissible || !sourceFlow || !(b.angle < .15 && b.error <= a.error
-                && b.area <= a.area + .03 && b.boundary <= a.boundary
-                && b.parts <= a.parts && b.nonquads <= a.nonquads))
+        if (!reference.openFoldWorkflow() || !admissible || !sourceFlow || !(b.angle < .15 && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.parts <= a.parts && b.nonquads <= a.nonquads))
             return false;
         const auto* guidance = sourceFlow();
-        if (!guidance || std::none_of(guidance->begin(), guidance->end(),
-                             [](const SurfaceGuidance::Face& face) { return face.confidence > 0; }))
+        if (!guidance || std::none_of(guidance->begin(), guidance->end(), [](const SurfaceGuidance::Face& face) { return face.confidence > 0; }))
             return false;
         const auto first = reference.measureLayoutFit(before.remeshedVertices(), before.remeshedQuads(), guidance);
         const auto second = reference.measureLayoutFit(after.remeshedVertices(), after.remeshedQuads(), guidance);
@@ -333,9 +331,9 @@ double AutoRemesher::calculateAverageEdgeLength(const std::vector<Vector3>& vert
     return sumOfLength / edgeCount;
 }
 
-void AutoRemesher::initializeVoxelSize()
+void AutoRemesher::initializeVoxelSize(const std::vector<std::vector<size_t>>& triangles)
 {
-    double area = calculateMeshArea(m_vertices, m_triangles);
+    double area = calculateMeshArea(m_vertices, triangles);
     double triangleArea = area / m_targetTriangleCount;
     m_voxelSize = std::sqrt(triangleArea / (0.86602540378 * 0.5));
 #if AUTO_REMESHER_DEBUG
@@ -638,6 +636,7 @@ bool AutoRemesher::remesh()
 {
     // Each run owns a fresh delivery, including when validation fails.
     m_preparedIslands.clear();
+    m_removedInputFinTriangles.clear();
     m_remeshedVertices.clear();
     m_remeshedQuads.clear();
     m_decimatedVertices.clear();
@@ -669,6 +668,23 @@ bool AutoRemesher::remesh()
             m_progressHandler(m_tag, 1.0, invalidInputReason);
         return false;
     }
+    m_removedInputFinTriangles = redundantInputFins(m_vertices, m_triangles);
+    std::vector<std::vector<size_t>> filteredTriangles;
+    std::vector<size_t> retainedTriangleIds;
+    if (!m_removedInputFinTriangles.empty()) {
+        size_t removed = 0;
+        for (size_t i = 0; i < m_triangles.size(); ++i) {
+            if (removed < m_removedInputFinTriangles.size() && m_removedInputFinTriangles[removed] == i) {
+                ++removed;
+                continue;
+            }
+            filteredTriangles.push_back(m_triangles[i]);
+            retainedTriangleIds.push_back(i);
+        }
+        std::cerr << "Input topology: removed " << m_removedInputFinTriangles.size()
+                  << " negligible dangling fin triangle(s)\n";
+    }
+    const auto& inputTriangles = m_removedInputFinTriangles.empty() ? m_triangles : filteredTriangles;
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // Each label names the step that is about to run, not the one that just
@@ -676,7 +692,7 @@ bool AutoRemesher::remesh()
     if (nullptr != m_progressHandler)
         m_progressHandler(m_tag, 0.0f, "Computing voxel size");
     auto t_voxelStart = std::chrono::high_resolution_clock::now();
-    initializeVoxelSize();
+    initializeVoxelSize(inputTriangles);
     auto t_voxelEnd = std::chrono::high_resolution_clock::now();
 
     if (nullptr != m_progressHandler)
@@ -684,7 +700,11 @@ bool AutoRemesher::remesh()
     std::vector<std::vector<std::vector<size_t>>> trianglesIslands;
     std::vector<std::vector<size_t>> sourceTriangleIds;
     auto t_splitStart = std::chrono::high_resolution_clock::now();
-    MeshSeparator::splitToIslands(m_triangles, trianglesIslands, &sourceTriangleIds);
+    MeshSeparator::splitToIslands(inputTriangles, trianglesIslands, &sourceTriangleIds);
+    if (!retainedTriangleIds.empty())
+        for (auto& ids : sourceTriangleIds)
+            for (auto& id : ids)
+                id = retainedTriangleIds[id];
     auto t_afterSplit = std::chrono::high_resolution_clock::now();
 
     if (trianglesIslands.empty()) {
@@ -782,8 +802,8 @@ bool AutoRemesher::remesh()
     {
         m_threadProgressWeights.assign(islandContexes.size(), 1.0f);
         for (size_t i = 0; i < islandContexes.size(); ++i) {
-            if (!m_triangles.empty())
-                m_threadProgressWeights[i] = (float)(((double)islandContexes[i].triangles.size() / m_triangles.size()));
+            if (!inputTriangles.empty())
+                m_threadProgressWeights[i] = (float)(((double)islandContexes[i].triangles.size() / inputTriangles.size()));
         }
         m_threadProgress.assign(islandContexes.size(), 0.0f);
         m_threadStatus.assign(islandContexes.size(), nullptr);
@@ -900,7 +920,7 @@ bool AutoRemesher::remesh()
     const double requested = m_targetTriangleCount * .5;
     const double samplingCount = std::max(3000., requested < 8000 ? requested : requested < 15000 ? 8000 + (requested - 8000) * 4 / 7
                                                                                                   : 12000);
-    const double samplingLength = std::sqrt(calculateMeshArea(m_vertices, m_triangles) / samplingCount);
+    const double samplingLength = std::sqrt(calculateMeshArea(m_vertices, inputTriangles) / samplingCount);
     tbb::parallel_for(size_t(0), featureContexts.size(), [&](size_t i) {
         auto& c = featureContexts[i];
         // Remesher prepare/quota.cpp uses quad area, with a 20-cell spacing

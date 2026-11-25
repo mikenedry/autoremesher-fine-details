@@ -193,8 +193,7 @@ bool Parameterizer::parameterize(bool featureLayout)
             // Capture strict curvature before features replace alignment confidence.
             metric.strictCurvature = curvature.confidence == 1.;
             const double major = std::fabs(curvature.major), minor = std::fabs(curvature.minor);
-            metric.anisotropy = metric.strictCurvature && major > 0 ?
-                std::max(0., std::min(1., (major - minor) / major)) : 0.;
+            metric.anisotropy = metric.strictCurvature && major > 0 ? std::max(0., std::min(1., (major - minor) / major)) : 0.;
         }
         guidance = measured.transfer(topology, true);
         for (size_t f = 0; f < topology.faceCount(); ++f)

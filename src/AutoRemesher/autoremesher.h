@@ -194,6 +194,9 @@ public:
         return m_isotropicExtractedConnections;
     }
 
+    // IDs address constructor input; source geometry itself is never modified.
+    const std::vector<size_t>& removedInputFinTriangles() const { return m_removedInputFinTriangles; }
+
     bool remesh();
 
     // `progress` is how far island `threadIndex` has got, 0..1.  `status` names
@@ -236,6 +239,7 @@ private:
     const std::vector<Vector3> m_vertices;
     const std::vector<std::vector<size_t>> m_triangles;
     std::vector<PreparedIsland> m_preparedIslands;
+    std::vector<size_t> m_removedInputFinTriangles;
     std::vector<Vector3> m_remeshedVertices;
     std::vector<std::vector<size_t>> m_remeshedQuads;
     std::vector<Vector3> m_decimatedVertices;
@@ -279,7 +283,7 @@ private:
 
     static double calculateAverageEdgeLength(const std::vector<Vector3>& vertices,
         const std::vector<std::vector<size_t>>& faces);
-    void initializeVoxelSize();
+    void initializeVoxelSize(const std::vector<std::vector<size_t>>& triangles);
     static bool decimateIfTooDense(std::vector<Vector3>& vertices,
         std::vector<std::vector<size_t>>& triangles,
         double voxelSize,

@@ -47,3 +47,5 @@ qrc_*.cpp
 .DS_Store
 
 moc/
+
+__pycache__/

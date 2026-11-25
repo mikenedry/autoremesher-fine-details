@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+// Imported additions retain GPL-3.0-or-later; original MIT notice follows.
 /*
  *  Copyright (c) 2026 Jeremy HU <jeremy-at-dust3d dot org>. All rights reserved.
  *
@@ -31,6 +33,28 @@
 
 namespace AutoRemesher {
 namespace {
+    int cachedVertexCharge(const SurfaceMesh& mesh, const std::vector<int>& mismatch, size_t vertex)
+    {
+        const auto& corners = mesh.cornersAroundVertex(vertex);
+        if (corners.empty())
+            return 0;
+        const size_t start = corners.front();
+        size_t corner = start, steps = 0;
+        int sum = 0;
+        do {
+            if (++steps > mesh.cornerCount())
+                return 0;
+            sum += mismatch[corner];
+            const size_t opposite = mesh.oppositeCorner(corner);
+            if (opposite == SurfaceMesh::npos)
+                return 0;
+            corner = mesh.nextCorner(opposite);
+            if (mesh.cornerVertex(corner) != vertex)
+                return 0;
+        } while (corner != start);
+        return ((sum % 4) + 4) % 4;
+    }
+
     Vector3 unit(const Vector3& value, const Vector3& fallback)
     {
         return value.length() < 1e-12 ? fallback.normalized() : value.normalized();
@@ -328,11 +352,22 @@ bool SingularitySimplifier::cancelPair(size_t first, size_t second, size_t hops)
     if (path.size() < 2) {
         return false;
     }
-    std::vector<char> affected(m_mesh.vertexCount(), 0);
+    std::vector<size_t> affected;
     for (size_t f : region)
         for (size_t c = 3 * f; c < 3 * f + 3; ++c)
-            affected[m_mesh.cornerVertex(c)] = 1;
-    const auto countAffected = [&]() { size_t count=0; const auto charges=vertexCharges(); for(size_t v=0;v<affected.size();++v) if(affected[v]&&charges[v]!=0) ++count; return count; };
+            affected.push_back(m_mesh.cornerVertex(c));
+    std::sort(affected.begin(), affected.end());
+    affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+    const auto charge = [&](size_t vertex) {
+        return cachedVertexCharge(m_mesh, m_mismatch, vertex);
+    };
+    const auto countAffected = [&]() {
+        size_t count = 0;
+        for (size_t vertex : affected)
+            if (charge(vertex) != 0)
+                ++count;
+        return count;
+    };
     const size_t before = countAffected();
     std::vector<double> saved;
     saved.reserve(freeFaces.size());
@@ -347,7 +382,7 @@ bool SingularitySimplifier::cancelPair(size_t first, size_t second, size_t hops)
                 continue;
             jump[c] = static_cast<int>(std::lround((m_angles[m_mesh.cornerFace(other)] - m_angles[f] - m_connection[c]) / (M_PI / 2.0)));
         }
-    const int carried = (((vertexCharges()[first] + 1) % 4) + 4) % 4 - 1;
+    const int carried = (((charge(first) + 1) % 4) + 4) % 4 - 1;
     for (size_t i = 0; i + 1 < path.size(); ++i) {
         const size_t corner = cornerAlongEdge(path[i], path[i + 1]);
         if (corner == SurfaceMesh::npos) {
@@ -382,8 +417,7 @@ bool SingularitySimplifier::cancelPair(size_t first, size_t second, size_t hops)
     }
     updateMismatches(region);
     const size_t after = countAffected();
-    const auto charges = vertexCharges();
-    if (charges[first] != 0 || charges[second] != 0 || after + 2 > before) {
+    if (charge(first) != 0 || charge(second) != 0 || after + 2 > before) {
         for (size_t i = 0; i < freeFaces.size(); ++i)
             m_angles[freeFaces[i]] = saved[i];
         updateMismatches(region);
